@@ -10,9 +10,8 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P4 - the full pipeline runs live behind a web dashboard: the
-labelled feed, the list of enrolled people, and enroll-from-webcam.
-Threshold is provisional until P5.
+**Status:** P5 - the full pipeline, the dashboard, a benchmark, and an
+evaluation on LFW plus webcam probes. The threshold is set from that data.
 
 ## Architecture
 
@@ -89,7 +88,19 @@ python -c "import zipfile; zipfile.ZipFile('models/buffalo_sc.zip').extractall('
 ```
 
 That yields `models/buffalo_sc/det_500m.onnx` (the detector, 2.5 MB) and
-`models/buffalo_sc/w600k_mbf.onnx` (the embedder, 13 MB). Then:
+`models/buffalo_sc/w600k_mbf.onnx` (the embedder, 13 MB).
+
+Only for `facepipe eval`: LFW and its pairs file, 172 MB, 13k files.
+Extract them anywhere (a synced folder is a poor choice for 13k files)
+and point `--lfw` / `--pairs` at them:
+
+```
+curl -L -o lfw.tgz https://ndownloader.figshare.com/files/5976018
+curl -L -o pairs.txt https://ndownloader.figshare.com/files/5976006
+tar -xzf lfw.tgz          # -> lfw/<Person_Name>/<Person_Name>_0001.jpg ...
+```
+
+Then:
 
 ```
 facepipe show-config              # loads and validates config.toml, prints it
@@ -98,6 +109,7 @@ facepipe run --frames 300         # stop after 300 frames and print the timing s
 facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png, one face each
 facepipe serve                    # dashboard at http://127.0.0.1:8000; Ctrl-C stops it
 facepipe bench --video clip.mp4   # per-stage latency and FPS over a fixed input (or --images DIR)
+facepipe eval --lfw DIR --pairs F  # similarity distributions, TAR/FAR, threshold; see Threshold below
 python -m unittest discover tests # the math tests
 ```
 
@@ -155,23 +167,143 @@ matcher will then report whichever name has the most similar image.
 
 ## Threshold
 
-A face is named when its cosine similarity to an enrolled image reaches
-`matcher.threshold` in `config.toml`. **The current value, 0.4, is
-provisional.** It was set from a handful of observations, not from data:
+`matcher.threshold = 0.26`. A face is named when its cosine similarity to
+the best of a person's enrolled images reaches this; below it the face is
+"unknown". The value is the point where the false accept rate on LFW's
+different-person pairs is 0.1%, rounded up (rounding up can only lower
+the false accept rate). Everything below is the output of `facepipe eval`.
 
-| Pair | Cosine |
-| --- | --- |
-| Same person, same pose, frames 1.5 s apart | 0.92 |
-| Five enrollment frames of one person, pairwise | 0.76 - 0.96 |
-| Same person over 115 live frames (moving, turning) | 0.46 - 0.92, mean 0.78 |
-| Frontal with a drawn overlay vs looking down | 0.53 |
-| A face vs a random-noise crop | 0.13 |
+### The test set
 
-Same-person similarities drop into the 0.4-0.5 range under motion blur and
-head turns; a few live frames fall below 0.4 and flicker to "unknown".
-Where different-person similarities sit is not known yet. The evaluation
-(P5) measures both distributions on a labelled set and picks the threshold
-from the TAR/FAR curve; this section is rewritten then.
+- **Strangers: LFW** (Labeled Faces in the Wild), 13,233 images of 5,749
+  people, with its official `pairs.txt`: 10 folds of 300 same-person and
+  300 different-person pairs, all 6,000 used. LFW is not committed; see
+  Setup for the download and Model licenses for its terms. LFW frames the
+  labelled person in the middle, so when several faces are detected the
+  one nearest the centre is taken (that is the protocol's definition; it
+  is not what enrollment does). 10 of the 7,701 images had no detection at
+  `conf_threshold = 0.5`: those pairs are excluded from the distributions
+  and counted as errors in the second accuracy figure.
+- **The enrolled person: 30 probe frames** of the one enrolled person,
+  captured in a single sitting a day after enrollment - head turned and
+  tilted, leaning in and back, talking, gesturing; same room, same
+  lighting, glasses on throughout - scored against the 5 enrolled images.
+  This is the deployed situation and an easy one, and it is reported
+  separately for that reason.
+- **Strangers at the camera:** all 7,691 detected LFW faces scored against
+  the enrolled gallery, best of the 5 rows, exactly as the matcher scores
+  a live face. This is the false-accept case that matters for a system
+  with an "unknown" path.
+
+### LFW: similarity distributions
+
+| pairs | n | min | p1 | p5 | p25 | median | p75 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| same person | 2989 | -0.004 | 0.289 | 0.407 | 0.539 | 0.616 | 0.692 | 0.791 | 0.862 | 0.963 |
+| different person | 2993 | -0.216 | -0.146 | -0.103 | -0.041 | 0.004 | 0.048 | 0.112 | 0.166 | 0.332 |
+
+### LFW: operating points
+
+| Criterion | Threshold | TAR | FAR |
+| --- | --- | --- | --- |
+| FAR = 1.0% | 0.169 | 0.9963 | 0.0097 |
+| **FAR = 0.1%** | **0.256** | **0.9920** | **0.0007** |
+| equal error rate | 0.188 | 0.9957 | 0.0043 |
+| max accuracy (0.9963) | 0.209 | 0.9943 | 0.0017 |
+
+10-fold accuracy with the threshold fitted on the other nine folds:
+**99.52% +/- 0.28%** excluding the detection failures, 99.22% +/- 0.60%
+counting them as errors. InsightFace does not publish an LFW figure for
+this particular WebFace600K MobileFaceNet; the MobileFaceNet paper (Chen
+et al., 2018) reports 99.55% for its MS1M-trained model. Being in that
+range is the check that the alignment and preprocessing here reproduce
+what the model was trained with; a wrong landmark order or a wrong
+normalization would cost whole points.
+
+### The enrolled person and strangers at the camera
+
+| pairs | n | min | p1 | p5 | p25 | median | p75 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| probe vs enrolled, all 30 x 5 pairs | 150 | 0.471 | 0.482 | 0.503 | 0.566 | 0.613 | 0.649 | 0.688 | 0.695 | 0.709 |
+| probe vs enrolled, best per probe (what the matcher uses) | 30 | 0.585 | 0.589 | 0.604 | 0.632 | 0.650 | 0.686 | 0.695 | 0.705 | 0.709 |
+| LFW face vs enrolled, best per face | 7691 | -0.217 | -0.113 | -0.078 | -0.023 | 0.014 | 0.056 | 0.114 | 0.155 | 0.239 |
+
+| Threshold | from | probes accepted (TAR) | LFW faces accepted as the enrolled person |
+| --- | --- | --- | --- |
+| 0.169 | LFW FAR 1% | 30/30 | 38 of 7691 (0.49%) |
+| 0.188 | LFW EER | 30/30 | 13 of 7691 (0.17%) |
+| 0.209 | LFW max accuracy | 30/30 | 3 of 7691 (0.04%) |
+| **0.256** | **LFW FAR 0.1%** | **30/30** | **0 of 7691** |
+| 0.400 | the provisional value | 30/30 | 0 of 7691 |
+
+### Reading it
+
+- The two LFW distributions barely overlap: same-person p5 is 0.41,
+  different-person p95 is 0.11. That is the model working.
+- The webcam same-person set is easy (best-per-probe minimum 0.585) because
+  it was captured in the conditions it was enrolled in. LFW's same-person
+  tail (p1 = 0.29, minimum below zero) is what years, lighting and pose do,
+  and it is why the threshold is set on LFW rather than on the webcam set.
+- 0.26 keeps 99.2% of LFW same-person pairs and rejects every one of 7,691
+  strangers against this gallery, with 0.02 to spare above the closest
+  stranger (0.239). The provisional 0.40 would have rejected ~5% of
+  LFW-style same-person pairs and sat within 0.06 of the motion-blurred
+  live frames seen in P3.
+- The false accept rate of the deployed system grows with the gallery:
+  each enrolled person, and each extra image per person under best-row
+  scoring, is another chance for a stranger to clear the threshold. This
+  evaluation is one person with five images; re-run `facepipe eval` after
+  the gallery grows and look at the last table again.
+
+Curves (threshold vs LFW TAR/FAR, probe TAR, strangers accepted) are
+written to `--out` as CSV. Re-run:
+
+```
+facepipe eval --lfw <lfw dir> --pairs <pairs.txt> --probes data/eval/probes --out data/eval/results
+```
+
+Probes are `data/eval/probes/<name>/*.jpg` for any enrolled `<name>`;
+capture them with any camera app. Per-image embeddings are cached per
+embedder file, so a re-run costs seconds and the INT8 comparison reuses
+the float side.
+
+## Known limitations
+
+Specific to this build, with the evidence where there is any.
+
+- **Pose.** Alignment is a 2D similarity transform; it cannot undo a head
+  turn. A profile crop puts the template's far-eye point on the side of the
+  head (seen in P2), and profile embeddings score far below frontal ones:
+  the dashboard showed "unknown" for the enrolled person in profile with a
+  hand at the face. Enroll frontal images; expect misses beyond ~45
+  degrees.
+- **Lighting and blur.** Live similarity of the enrolled person ranged
+  0.46-0.92 over 150 frames under motion; the probe set, captured still,
+  never dropped below 0.585. Strong backlight and fast motion are the
+  cases that reach the threshold.
+- **Occlusion.** Glasses were on in every enrolled and probe image, so
+  their effect is unmeasured here; masks and hands over the face reduce
+  the detector's confidence first (it uses `conf_threshold = 0.5`) and
+  the embedding second.
+- **Single-image enrollment is weak.** Best-row scoring means one enrolled
+  image covers one pose and one lighting; the five-image enrollment here
+  scored its own probes 0.47-0.71 pairwise but 0.59-0.71 best-per-probe.
+  Enroll several images, in the conditions the camera will see.
+- **Demographic bias in the pretrained weights.** Both models were trained
+  on web-scraped datasets (WIDER FACE for the detector, WebFace600K for the
+  embedder) whose demographic balance is not controlled, and face
+  recognition models are documented to have higher error rates for some
+  groups than others (NIST FRVT reports). LFW itself is skewed towards
+  public figures, mostly white and male, so the 99.5% here is not a
+  guarantee for other faces. This project measures one enrolled person.
+- **Same person, two names** is not prevented; the matcher reports
+  whichever name has the closest image.
+- **No liveness detection.** A photo of an enrolled person held up to the
+  camera is that person. Out of scope by design.
+- **Small-face recall.** SCRFD-500M at `input_size = 640` handles faces
+  down to roughly 20 px; at 320 it loses small and distant faces, which is
+  the price of its 3x speed.
+- **False accepts scale with the gallery**, as described under Threshold.
 
 ## Enrollment and the store
 
@@ -226,6 +358,7 @@ facepipe/           the package; one module per concern
   enroll.py         the enroll command
   dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
   bench.py          the bench command: fixed input, warm-up, median/p95 per stage, FPS, ranges over repeats
+  evaluate.py       the eval command: LFW pairs protocol, webcam probes vs the gallery, TAR/FAR, threshold
 tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
@@ -291,6 +424,7 @@ table above is the one to quote; the live numbers are what a user sees.
 | Model | Source | License |
 | --- | --- | --- |
 | MobileFaceNet, `w600k_mbf.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | Same terms as the detector: non-commercial research only. Trained on WebFace600K, itself a research-use dataset. Every high-accuracy face recognition weight set available is in this position because the training sets are; SFace from OpenCV Zoo (Apache-2.0) is the permissive option at lower accuracy. |
+| LFW (evaluation data, not a model) | University of Massachusetts; mirrored on figshare, files 5976018 (`lfw.tgz`, 172 MB) and 5976006 (`pairs.txt`) | Distributed for research; the images are web-scraped and their subjects did not consent to face-recognition use, which is why it is used here for measurement only and never committed. |
 | SCRFD-500M, `det_500m.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | InsightFace's code is MIT, but its README states that the training data and the models trained on it "are available for non-commercial research purposes only", and that this applies to manual downloads from GitHub as well. This project is research/educational use. A commercial deployment would need weights trained on licensed data; YuNet (MIT) is the permissively licensed detector option. |
 
 ## Tooling decisions
@@ -313,6 +447,8 @@ reasons are labelled as such.
 | Matching: cosine, best enrolled row per person | mean embedding per person | Cosine is one dot product because embeddings are unit length. Scoring a person by their best row is what makes enrolling several photos useful: a half-turned query matches the half-turned photo, where a mean of frontal and turned fits neither. The cost is that one mislabelled enrolled image gives that person false matches, which is why enroll refuses to guess on multi-face images. |
 | `http.server` (standard library) for the dashboard | Flask; FastAPI + uvicorn | Three endpoints and one page. Flask would be about 40 lines shorter and is the ease choice; it costs seven packages. FastAPI is async and ten-plus packages for a page with no concurrency problem. The dashboard is not what the project is about, and a target box is happier with fewer packages, so zero-dep won. |
 | MJPEG stream for the live feed | polling a JPEG URL from JavaScript; WebSocket | One `<img>` tag and no JavaScript; every browser supports it; the server pushes at the pipeline's rate. Polling jitters and needs JS; WebSocket needs a library or a hand-written handshake. |
+| LFW pairs protocol for the evaluation | photographing people I know; a synthetic set | Public, research-licensed, 6,000 labelled pairs with a published reference point for this class of model, so a subtly wrong alignment or normalization would show up as lost accuracy. A hand-made set could not have said that. It is combined with webcam probes of the enrolled person because LFW says nothing about this camera. |
+| Threshold at LFW FAR = 0.1% | EER; max accuracy; the midpoint between the webcam distributions | A system with an "unknown" path is judged on strangers it lets in, so a false-accept target is the right criterion. EER and max-accuracy thresholds (0.19-0.21) let 13 and 3 of 7,691 strangers through this one-person gallery; a webcam-only midpoint (~0.41) would be tuned to one sitting's conditions. |
 | `facepipe bench` over a file, medians and ranges | timing the live loop | A camera paces the loop at its own frame rate and changes the picture every run; a file does neither. Median and p95 instead of mean because the first frames after a model loads are slow and a mean hides the shape. Ranges over repeats because the laptop's CPU state moves the numbers by 2x between sessions and one number would be a lie. |
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |

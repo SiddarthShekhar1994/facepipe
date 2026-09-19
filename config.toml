@@ -16,7 +16,7 @@ input_size = 640                                 # letterbox side; 320 is ~4x ch
 model_path = "models/buffalo_sc/w600k_mbf.onnx"   # MobileFaceNet trained on WebFace600K; 512-d output
 
 [matcher]
-threshold = 0.4   # PROVISIONAL: cosine similarity needed to be named; the evaluation (P5) replaces this
+threshold = 0.26  # cosine similarity needed to be named; LFW FAR = 0.1% point, see README "Threshold"
 top_k = 3         # names returned per face, best first
 
 [store]

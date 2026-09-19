@@ -9,6 +9,7 @@ from facepipe.bench import bench
 from facepipe.config import ConfigError, load_config
 from facepipe.dashboard import serve
 from facepipe.enroll import enroll
+from facepipe.evaluate import evaluate
 from facepipe.run import run
 
 
@@ -37,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--warmup", type=int, default=30, help="frames to run and discard first (default: %(default)s)")
     p_bench.add_argument("--repeat", type=int, default=1, help="repeat the whole run and report ranges (default: %(default)s)")
     p_bench.add_argument("--input-size", type=int, default=None, help="override detector.input_size for this run")
+    p_eval = sub.add_parser("eval", parents=[common], help="similarity distributions, TAR/FAR and the threshold, on LFW plus webcam probes")
+    p_eval.add_argument("--lfw", default="data/eval/lfw", help="LFW root: one directory per person (default: %(default)s)")
+    p_eval.add_argument("--pairs", default="data/eval/pairs.txt", help="the official LFW pairs.txt (default: %(default)s)")
+    p_eval.add_argument("--probes", default="data/eval/probes", help="<dir>/<name>/*.jpg probes of enrolled people (default: %(default)s)")
+    p_eval.add_argument("--folds", type=int, default=None, help="use only the first N LFW folds (default: all 10)")
+    p_eval.add_argument("--out", default="data/eval/results", help="where the embedding cache and curves go (default: %(default)s)")
     args = parser.parse_args(argv)
 
     try:
@@ -56,4 +63,6 @@ def main(argv: list[str] | None = None) -> int:
         serve(cfg, args.host, args.port)
     elif args.command == "bench":
         return bench(cfg, args.video, args.images, args.frames, args.warmup, args.repeat, args.input_size)
+    elif args.command == "eval":
+        return evaluate(cfg, args.lfw, args.pairs, args.probes, args.folds, args.out)
     return 0
