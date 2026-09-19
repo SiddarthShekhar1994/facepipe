@@ -12,3 +12,6 @@ input_size = 640                                 # letterbox side; 320 is ~4x ch
 
 [embedder]
 model_path = "models/buffalo_sc/w600k_mbf.onnx"   # MobileFaceNet trained on WebFace600K; 512-d output
+
+[store]
+path = "data/enrolled"   # one sub-directory per person; gitignored because it holds face images

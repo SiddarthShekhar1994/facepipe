@@ -40,10 +40,16 @@ class EmbedderConfig:
 
 
 @dataclass(frozen=True)
+class StoreConfig:
+    path: str  # directory of enrolled people, one sub-directory each; created on first enroll
+
+
+@dataclass(frozen=True)
 class Config:
     source: SourceConfig
     detector: DetectorConfig
     embedder: EmbedderConfig
+    store: StoreConfig
 
 
 def load_config(path: str | Path) -> Config:

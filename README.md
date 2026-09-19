@@ -10,8 +10,8 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P1 - webcam capture and face detection with per-stage timing. No
-recognition yet.
+**Status:** P2 - detection, alignment, embedding, and enrollment from a folder
+of images. No live matching yet.
 
 ## Architecture
 
@@ -19,18 +19,19 @@ recognition yet.
   FrameSource   (webcam | video file | image directory)
        |  Frame: HxWx3 uint8 BGR
        v
-  Detector      SCRFD-500M on ONNX Runtime              ---.
-       |  list[Detection]: bbox, 5 landmarks, confidence   |
-       v                                                   |  on the target system:
-  Aligner       5-point similarity transform               |  FPGA board
-       |  crop: fixed size, one per detection              |
-       v                                                   |
-  Embedder      load() / infer()                        ---'
-       |  Embedding: (D,) float32, L2-normalized
+  Detector      SCRFD-500M on ONNX Runtime                   ---.
+       |  list[Detection]: bbox, 5 landmarks, confidence        |
+       v                                                        |  on the target system:
+  Aligner       Umeyama similarity fit onto the ArcFace         |  FPGA board
+       |        template, warpAffine to 112x112                 |
+       |  crop: 112x112 uint8 BGR, one per detection            |
+       v                                                        |
+  Embedder      MobileFaceNet on ONNX Runtime                ---'
+       |  Embedding: (512,) float32, L2-normalized
        v
   Matcher       cosine vs gallery, threshold, top-k  <----  Store   ---.
-       |  list[Match] per face; empty list = unknown                   |  server
-       v                                                               |
+       |  list[Match] per face; empty list = unknown          one dir  |  server
+       v                                                    per person |
   Dashboard     live feed with labels, enrolled list, enroll        ---'
 ```
 
@@ -82,12 +83,14 @@ python -c "import zipfile; zipfile.ZipFile('models/buffalo_sc.zip').extractall('
 ```
 
 That yields `models/buffalo_sc/det_500m.onnx` (the detector, 2.5 MB) and
-`w600k_mbf.onnx` (a recognition model, not used yet). Then:
+`models/buffalo_sc/w600k_mbf.onnx` (the embedder, 13 MB). Then:
 
 ```
 facepipe show-config              # loads and validates config.toml, prints it
 facepipe run                      # live webcam window; q or Esc quits
 facepipe run --frames 300         # stop after 300 frames and print the timing summary
+facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png, one face each
+python -m unittest discover tests # the math tests
 ```
 
 `run` prints one line per second with the rolling mean of each stage in
@@ -107,6 +110,39 @@ startup with the key named, rather than silently using a default. Sections
 are added by the phase that reads them, so every key that exists is
 consumed by something.
 
+## Enrollment and the store
+
+`facepipe enroll <name> <folder>` runs every image through detect, align
+and embed and writes the result under `data/enrolled/<name>/`:
+
+```
+data/enrolled/alice/
+  meta.json          name, created_at, which embedder file produced the rows, images in row order
+  embeddings.npy     (K, 512) float32; row i came from images[i]
+  001.jpg 002.jpg    the reference images, copied in as given
+```
+
+Why this format:
+
+- `ls data/enrolled` is the list of people. Adding a person, or more images
+  of one, touches only that person's directory, so there is no global index
+  that a crash mid-write can corrupt. Deleting a person is deleting a
+  directory.
+- `.npy` is exact float32 with zero dependencies and one line to load.
+  JSON would be 512 floats of noise per row, pickle is opaque and unsafe to
+  load, and SQLite (standard library, and the obvious next step if this
+  grew) is more machinery than a handful of directories need.
+- `meta.json` records the embedder file because embeddings from different
+  models are silently incomparable. The store refuses to read or append a
+  person enrolled with a different embedder than the one configured.
+- The originals are stored, not the aligned crops, so the gallery can be
+  rebuilt after a model change by re-running enroll.
+
+Images with no face or with more than one face are skipped and named, not
+guessed at: enrolling the wrong person from a group photo is silent and
+poisons every later match. Crop such images to one face. Re-running
+enroll on a name appends to it.
+
 ## Layout
 
 ```
@@ -117,6 +153,11 @@ facepipe/           the package; one module per concern
   cli.py            argparse entry point; the only module that reads argv
   sources.py        FrameSource implementations: WebcamSource
   scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
+  align.py          Aligner implementation: Umeyama similarity fit onto the ArcFace template, warpAffine
+  arcface.py        Embedder implementation: MobileFaceNet on ONNX Runtime, L2-normalized output
+  store.py          Store implementation: one directory per person
+  enroll.py         the enroll command
+tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
 config.toml         the single config file
@@ -132,6 +173,8 @@ runs on the CPU execution provider.
 | Stage | `input_size=640` | `input_size=320` |
 | --- | --- | --- |
 | detect (SCRFD-500M) | 23-25 ms | 6.3 ms |
+| align (per face) | 0.55 ms | - |
+| embed (MobileFaceNet, per face) | 12.5 ms | - |
 | display (draw + imshow + waitKey) | 7-9 ms | - |
 | read (webcam) | 2-4 ms, camera-paced | - |
 | end to end | ~27 fps (camera caps at 30) | - |
@@ -146,6 +189,7 @@ numbers once alignment, embedding and matching exist.
 
 | Model | Source | License |
 | --- | --- | --- |
+| MobileFaceNet, `w600k_mbf.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | Same terms as the detector: non-commercial research only. Trained on WebFace600K, itself a research-use dataset. Every high-accuracy face recognition weight set available is in this position because the training sets are; SFace from OpenCV Zoo (Apache-2.0) is the permissive option at lower accuracy. |
 | SCRFD-500M, `det_500m.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | InsightFace's code is MIT, but its README states that the training data and the models trained on it "are available for non-commercial research purposes only", and that this applies to manual downloads from GitHub as well. This project is research/educational use. A commercial deployment would need weights trained on licensed data; YuNet (MIT) is the permissively licensed detector option. |
 
 ## Tooling decisions
@@ -162,5 +206,9 @@ reasons are labelled as such.
 | `dataclasses` for the config schema | pydantic | Pydantic is a dependency for the sake of ~a dozen keys. A 40-line strict mapper covers unknown keys, missing keys and wrong types. |
 | ONNX Runtime | PyTorch checkpoints; OpenCV `cv2.dnn` | One runtime for every model, and the `.onnx` file is the same artifact the FPGA flow starts from: AMD's Vitis AI quantizes ONNX graphs and runs them through an ONNX Runtime execution provider, so the laptop path and the board path share a model file. PyTorch would add ~2 GB of dependency to run a 2.5 MB network. `cv2.dnn` would run it but has no quantization tooling and is not the deployment path. |
 | SCRFD-500M with keypoints (InsightFace) | YuNet (OpenCV Zoo), RetinaFace-MobileNet, UltraFace, the `insightface` package | The detector must output 5 landmarks or there is nothing to align on, which rules out UltraFace. SCRFD's landmarks use the same convention as the ArcFace alignment template, so detection and recognition agree by construction. YuNet is MIT-licensed and smaller but has lower recall on small and hard faces, and its raw ONNX needs the same hand-written decode. RetinaFace is older with no advantage. The `insightface` pip package would do detect+align+embed in one call, which hides the module boundaries this project exists to show, and needs a C++ toolchain on Windows. SCRFD's weights are non-commercial research only; see Model licenses. Larger SCRFD variants (2.5G, 10G) are a `model_path` change. |
+| Umeyama similarity fit, in numpy | `cv2.estimateAffinePartial2D`; scikit-image `SimilarityTransform` | The alignment must be a similarity (rotation, uniform scale, translation) fitted over all five landmarks, exactly as at training time. OpenCV's estimator is RANSAC/LMedS-based and with five points may discard one as an outlier. scikit-image is what InsightFace calls, and it computes this same closed form; not worth a dependency for 15 lines. A full affine fit was rejected because it would shear the face. |
+| MobileFaceNet (`w600k_mbf`, 512-d) | ResNet-50 (`w600k_r50`, 166 MB); SFace (OpenCV Zoo) | Already in the downloaded pack, ~10x cheaper than the ResNet-50, and the class of network that would actually be deployed to a DPU, which makes the quantization experiment representative. The accuracy cost is measured in the evaluation; switching is a `model_path` change plus a download. SFace is Apache-2.0 but weaker. |
+| Store: a directory per person, `.npy` + `meta.json` | one JSON index; SQLite; pickle | See "Enrollment and the store". |
+| `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |
