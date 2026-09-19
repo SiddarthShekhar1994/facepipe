@@ -1,9 +1,11 @@
 # facepipe configuration. Sections are added by the phase that reads them.
 
 [source]
-device = 0    # webcam index as OpenCV enumerates it
-width = 640   # requested capture size; the driver picks the nearest mode it supports
+kind = "webcam"   # "webcam" | "video" | "images"
+device = 0        # webcam: index as OpenCV enumerates it
+width = 640       # webcam: requested capture size; the driver picks the nearest mode it supports
 height = 480
+# path = "clip.mp4"   # video: the file; images: a directory of .jpg/.png
 
 [detector]
 model_path = "models/buffalo_sc/det_500m.onnx"   # SCRFD-500M with keypoints; see README for the download

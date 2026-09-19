@@ -22,9 +22,11 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class SourceConfig:
-    device: int  # webcam index as OpenCV enumerates it
-    width: int  # requested capture size; the driver picks the nearest mode it has
-    height: int
+    kind: str  # "webcam", "video" or "images"
+    device: int = 0  # webcam: index as OpenCV enumerates it
+    path: str = ""  # video: the file; images: the directory
+    width: int = 640  # webcam: requested capture size; the driver picks the nearest mode it has
+    height: int = 480
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,7 @@ import cv2
 from facepipe.config import Config
 from facepipe.draw import draw_results
 from facepipe.pipeline import STAGES, Pipeline
-from facepipe.sources import WebcamSource
+from facepipe.sources import make_source
 from facepipe.timing import StageTimer
 
 WINDOW = "facepipe"
@@ -25,7 +25,7 @@ def run(cfg: Config, max_frames: int | None = None) -> None:
     else:
         print(f"gallery: empty ({cfg.store.path}); every face will be unknown. Enroll with `facepipe enroll`.")
 
-    with WebcamSource(cfg.source.device, cfg.source.width, cfg.source.height) as source:
+    with make_source(cfg.source) as source:
         last_report = perf_counter()
         while max_frames is None or timer.frames < max_frames:
             with timer.stage("read"):

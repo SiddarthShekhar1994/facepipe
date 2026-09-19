@@ -21,7 +21,7 @@ import cv2
 from facepipe.config import Config
 from facepipe.draw import draw_results
 from facepipe.pipeline import STAGES, Pipeline
-from facepipe.sources import WebcamSource
+from facepipe.sources import make_source
 from facepipe.timing import StageTimer
 from facepipe.types import FaceResult, Frame, Identity
 
@@ -48,8 +48,7 @@ class Worker(threading.Thread):
         self._enroll_lock = threading.Lock()
 
     def run(self) -> None:
-        src = self._cfg.source
-        with WebcamSource(src.device, src.width, src.height) as source:
+        with make_source(self._cfg.source) as source:
             last_report = perf_counter()
             seq = 0
             while not self._stop.is_set():
