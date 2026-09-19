@@ -68,12 +68,29 @@ Requires Python 3.11 or newer (developed on 3.14).
 py -3.14 -m venv .venv            # python3 -m venv .venv outside Windows
 .venv\Scripts\activate            # source .venv/bin/activate outside Windows
 pip install -e .
+facepipe show-config              # loads and validates config.toml, prints it
 ```
+
+`facepipe --help` lists the subcommands. Every subcommand takes `--config`
+(default `config.toml`). Paths inside the config are relative to the
+directory you run from, so run from the repo root.
+
+## Configuration
+
+`config.toml` is the single config file. It is loaded strictly: an unknown
+key, a missing key, or a value of the wrong type stops the program at
+startup with the key named, rather than silently using a default. Sections
+are added by the phase that reads them, so every key that exists is
+consumed by something.
 
 ## Layout
 
 ```
 facepipe/           the package; one module per concern
+  types.py          data that crosses stage boundaries: Frame, Detection, Embedding, Match, Identity
+  interfaces.py     the six abstract stages
+  config.py         TOML -> frozen dataclasses, strict
+  cli.py            argparse entry point; the only module that reads argv
 config.toml         the single config file
 pyproject.toml      package metadata and exact dependency pins
 ```
@@ -88,3 +105,6 @@ reasons are labelled as such.
 | Python 3.11+ | - | `tomllib` in the standard library. Developed on 3.14, the newest version both OpenCV and ONNX Runtime ship wheels for. |
 | `pyproject.toml` with exact pins | `requirements.txt` | Either works for an application. One file instead of two, and it gives a `facepipe` console script. |
 | numpy | - | The type of every stage boundary: frames, crops, embeddings. |
+| TOML via `tomllib` | YAML (PyYAML), JSON | Zero dependencies and supports comments. YAML would add a dependency for no gain at this size; JSON cannot carry comments. |
+| `dataclasses` for the config schema | pydantic | Pydantic is a dependency for the sake of ~a dozen keys. A 40-line strict mapper covers unknown keys, missing keys and wrong types. |
+| `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |

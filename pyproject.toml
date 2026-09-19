@@ -13,3 +13,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["facepipe"]
+
+[project.scripts]
+facepipe = "facepipe.cli:main"
