@@ -36,8 +36,12 @@ class ArcFaceEmbedder(Embedder):
         return self._input_size
 
     def infer(self, crop: np.ndarray) -> Embedding:
-        rgb = crop[:, :, ::-1].astype(np.float32)
-        blob = np.ascontiguousarray(((rgb - 127.5) / 127.5).transpose(2, 0, 1)[None])
-        (out,) = self._session.run(None, {self._input_name: blob})
+        (out,) = self._session.run(None, {self._input_name: self.preprocess(crop)})
         vec = out[0]
         return vec / np.linalg.norm(vec)
+
+    @staticmethod
+    def preprocess(crop: np.ndarray) -> np.ndarray:
+        """BGR uint8 crop -> the (1, 3, H, W) float32 blob the network takes. Also used for calibration."""
+        rgb = crop[:, :, ::-1].astype(np.float32)
+        return np.ascontiguousarray(((rgb - 127.5) / 127.5).transpose(2, 0, 1)[None])

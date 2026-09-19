@@ -13,6 +13,9 @@ dependencies = [
     "onnxruntime==1.30.0",
 ]
 
+[project.optional-dependencies]
+quant = ["onnx==1.23.0"]  # only to produce an INT8 model with `facepipe quantize`; never needed to run one
+
 [tool.setuptools]
 packages = ["facepipe"]
 

@@ -10,6 +10,7 @@ from facepipe.config import ConfigError, load_config
 from facepipe.dashboard import serve
 from facepipe.enroll import enroll
 from facepipe.evaluate import evaluate
+from facepipe.quantize import SCHEMES, quantize
 from facepipe.run import run
 
 
@@ -44,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--probes", default="data/eval/probes", help="<dir>/<name>/*.jpg probes of enrolled people (default: %(default)s)")
     p_eval.add_argument("--folds", type=int, default=None, help="use only the first N LFW folds (default: all 10)")
     p_eval.add_argument("--out", default="data/eval/results", help="where the embedding cache and curves go (default: %(default)s)")
+    p_quant = sub.add_parser("quantize", parents=[common], help="write an INT8 copy of the embedder (needs: pip install -e .[quant])")
+    p_quant.add_argument("--scheme", choices=SCHEMES, default="dpu", help="dpu: per-tensor symmetric, power-of-two scales; ort: per-channel, asymmetric activations (default: %(default)s)")
+    p_quant.add_argument("--calib", required=True, help="directory tree of face images for calibration and the agreement check (LFW works)")
+    p_quant.add_argument("--pairs", default=None, help="LFW pairs.txt; images it names are excluded so the evaluation stays disjoint")
+    p_quant.add_argument("--out", default=None, help="output .onnx (default: <embedder>_int8_<scheme>.onnx next to the float model)")
+    p_quant.add_argument("--count", type=int, default=100, help="calibration crops; the calibrator holds every activation of each in memory (default: %(default)s)")
+    p_quant.add_argument("--check", type=int, default=1000, help="held-out crops for the float-vs-INT8 agreement check (default: %(default)s)")
     args = parser.parse_args(argv)
 
     try:
@@ -65,4 +73,6 @@ def main(argv: list[str] | None = None) -> int:
         return bench(cfg, args.video, args.images, args.frames, args.warmup, args.repeat, args.input_size)
     elif args.command == "eval":
         return evaluate(cfg, args.lfw, args.pairs, args.probes, args.folds, args.out)
+    elif args.command == "quantize":
+        return quantize(cfg, args.scheme, args.calib, args.pairs, args.out, args.count, args.check)
     return 0
