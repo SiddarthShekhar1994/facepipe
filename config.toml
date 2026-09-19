@@ -1,1 +1,6 @@
 # facepipe configuration. Sections are added by the phase that reads them.
+
+[source]
+device = 0    # webcam index as OpenCV enumerates it
+width = 640   # requested capture size; the driver picks the nearest mode it supports
+height = 480

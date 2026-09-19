@@ -10,7 +10,7 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P0 - skeleton, stage interfaces, config loading, CLI. No models yet.
+**Status:** P1 in progress - webcam capture and a timed display loop. No models yet.
 
 ## Architecture
 
@@ -69,7 +69,14 @@ py -3.14 -m venv .venv            # python3 -m venv .venv outside Windows
 .venv\Scripts\activate            # source .venv/bin/activate outside Windows
 pip install -e .
 facepipe show-config              # loads and validates config.toml, prints it
+facepipe run                      # live webcam window; q or Esc quits
+facepipe run --frames 300         # stop after 300 frames and print the timing summary
 ```
+
+`run` prints one line per second with the rolling mean of each stage in
+milliseconds and the frames per second, then a summary with p95s on exit.
+The first second is camera warm-up (auto-exposure settling) and is slow;
+ignore it.
 
 `facepipe --help` lists the subcommands. Every subcommand takes `--config`
 (default `config.toml`). Paths inside the config are relative to the
@@ -91,6 +98,9 @@ facepipe/           the package; one module per concern
   interfaces.py     the six abstract stages
   config.py         TOML -> frozen dataclasses, strict
   cli.py            argparse entry point; the only module that reads argv
+  sources.py        FrameSource implementations: WebcamSource
+  timing.py         StageTimer: per-stage ms and FPS for the frame loop
+  run.py            the live loop behind `facepipe run`
 config.toml         the single config file
 pyproject.toml      package metadata and exact dependency pins
 ```
@@ -107,4 +117,5 @@ reasons are labelled as such.
 | numpy | - | The type of every stage boundary: frames, crops, embeddings. |
 | TOML via `tomllib` | YAML (PyYAML), JSON | Zero dependencies and supports comments. YAML would add a dependency for no gain at this size; JSON cannot carry comments. |
 | `dataclasses` for the config schema | pydantic | Pydantic is a dependency for the sake of ~a dozen keys. A 40-line strict mapper covers unknown keys, missing keys and wrong types. |
+| OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |

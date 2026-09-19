@@ -9,6 +9,7 @@ description = "Local face detection and recognition pipeline: webcam in, labeled
 requires-python = ">=3.11"
 dependencies = [
     "numpy==2.5.3",
+    "opencv-python==5.0.0.93",
 ]
 
 [tool.setuptools]

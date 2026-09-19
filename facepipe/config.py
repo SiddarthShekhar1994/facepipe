@@ -21,8 +21,15 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class SourceConfig:
+    device: int  # webcam index as OpenCV enumerates it
+    width: int  # requested capture size; the driver picks the nearest mode it has
+    height: int
+
+
+@dataclass(frozen=True)
 class Config:
-    pass
+    source: SourceConfig
 
 
 def load_config(path: str | Path) -> Config:
