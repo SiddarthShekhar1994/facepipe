@@ -4,3 +4,8 @@
 device = 0    # webcam index as OpenCV enumerates it
 width = 640   # requested capture size; the driver picks the nearest mode it supports
 height = 480
+
+[detector]
+model_path = "models/buffalo_sc/det_500m.onnx"   # SCRFD-500M with keypoints; see README for the download
+conf_threshold = 0.5                             # faces scoring below this are dropped
+input_size = 640                                 # letterbox side; 320 is ~4x cheaper but loses small faces

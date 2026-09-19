@@ -28,8 +28,16 @@ class SourceConfig:
 
 
 @dataclass(frozen=True)
+class DetectorConfig:
+    model_path: str  # SCRFD .onnx with keypoints, relative to the working directory
+    conf_threshold: float  # faces scoring below this are dropped before NMS
+    input_size: int  # side of the square the frame is letterboxed into; multiple of 32
+
+
+@dataclass(frozen=True)
 class Config:
     source: SourceConfig
+    detector: DetectorConfig
 
 
 def load_config(path: str | Path) -> Config:
