@@ -10,7 +10,8 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P1 in progress - webcam capture and a timed display loop. No models yet.
+**Status:** P1 - webcam capture and face detection with per-stage timing. No
+recognition yet.
 
 ## Architecture
 
@@ -18,7 +19,7 @@ be swapped for the FPGA one without touching its neighbours.
   FrameSource   (webcam | video file | image directory)
        |  Frame: HxWx3 uint8 BGR
        v
-  Detector      load() / infer()                        ---.
+  Detector      SCRFD-500M on ONNX Runtime              ---.
        |  list[Detection]: bbox, 5 landmarks, confidence   |
        v                                                   |  on the target system:
   Aligner       5-point similarity transform               |  FPGA board
@@ -62,12 +63,28 @@ Rules the code follows:
 
 ## Setup
 
-Requires Python 3.11 or newer (developed on 3.14).
+Requires Python 3.11 or newer (developed on 3.14) and a webcam.
 
 ```
 py -3.14 -m venv .venv            # python3 -m venv .venv outside Windows
 .venv\Scripts\activate            # source .venv/bin/activate outside Windows
 pip install -e .
+```
+
+Model weights are not in the repo (see [Model licenses](#model-licenses)).
+Download the InsightFace `buffalo_sc` pack (15 MB) and unpack it into
+`models/`, which is gitignored:
+
+```
+mkdir models
+curl -L -o models/buffalo_sc.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+python -c "import zipfile; zipfile.ZipFile('models/buffalo_sc.zip').extractall('models/buffalo_sc')"
+```
+
+That yields `models/buffalo_sc/det_500m.onnx` (the detector, 2.5 MB) and
+`w600k_mbf.onnx` (a recognition model, not used yet). Then:
+
+```
 facepipe show-config              # loads and validates config.toml, prints it
 facepipe run                      # live webcam window; q or Esc quits
 facepipe run --frames 300         # stop after 300 frames and print the timing summary
@@ -99,11 +116,37 @@ facepipe/           the package; one module per concern
   config.py         TOML -> frozen dataclasses, strict
   cli.py            argparse entry point; the only module that reads argv
   sources.py        FrameSource implementations: WebcamSource
+  scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
 config.toml         the single config file
 pyproject.toml      package metadata and exact dependency pins
 ```
+
+## Performance
+
+Measured on the development laptop (CPU only, 640x480 webcam), from
+`facepipe run --frames 90`, after the camera warm-up second. The detector
+runs on the CPU execution provider.
+
+| Stage | `input_size=640` | `input_size=320` |
+| --- | --- | --- |
+| detect (SCRFD-500M) | 23-25 ms | 6.3 ms |
+| display (draw + imshow + waitKey) | 7-9 ms | - |
+| read (webcam) | 2-4 ms, camera-paced | - |
+| end to end | ~27 fps (camera caps at 30) | - |
+
+`read` is cheap because the camera produces frames at 30 fps in the
+background; by the time a 25 ms detection finishes, the next frame is
+already waiting. `display` is dominated by `waitKey`, which pumps the
+window's message loop. A benchmark over a fixed input replaces these live
+numbers once alignment, embedding and matching exist.
+
+## Model licenses
+
+| Model | Source | License |
+| --- | --- | --- |
+| SCRFD-500M, `det_500m.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | InsightFace's code is MIT, but its README states that the training data and the models trained on it "are available for non-commercial research purposes only", and that this applies to manual downloads from GitHub as well. This project is research/educational use. A commercial deployment would need weights trained on licensed data; YuNet (MIT) is the permissively licensed detector option. |
 
 ## Tooling decisions
 
@@ -117,5 +160,7 @@ reasons are labelled as such.
 | numpy | - | The type of every stage boundary: frames, crops, embeddings. |
 | TOML via `tomllib` | YAML (PyYAML), JSON | Zero dependencies and supports comments. YAML would add a dependency for no gain at this size; JSON cannot carry comments. |
 | `dataclasses` for the config schema | pydantic | Pydantic is a dependency for the sake of ~a dozen keys. A 40-line strict mapper covers unknown keys, missing keys and wrong types. |
+| ONNX Runtime | PyTorch checkpoints; OpenCV `cv2.dnn` | One runtime for every model, and the `.onnx` file is the same artifact the FPGA flow starts from: AMD's Vitis AI quantizes ONNX graphs and runs them through an ONNX Runtime execution provider, so the laptop path and the board path share a model file. PyTorch would add ~2 GB of dependency to run a 2.5 MB network. `cv2.dnn` would run it but has no quantization tooling and is not the deployment path. |
+| SCRFD-500M with keypoints (InsightFace) | YuNet (OpenCV Zoo), RetinaFace-MobileNet, UltraFace, the `insightface` package | The detector must output 5 landmarks or there is nothing to align on, which rules out UltraFace. SCRFD's landmarks use the same convention as the ArcFace alignment template, so detection and recognition agree by construction. YuNet is MIT-licensed and smaller but has lower recall on small and hard faces, and its raw ONNX needs the same hand-written decode. RetinaFace is older with no advantage. The `insightface` pip package would do detect+align+embed in one call, which hides the module boundaries this project exists to show, and needs a C++ toolchain on Windows. SCRFD's weights are non-commercial research only; see Model licenses. Larger SCRFD variants (2.5G, 10G) are a `model_path` change. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |
