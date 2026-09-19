@@ -35,9 +35,15 @@ class DetectorConfig:
 
 
 @dataclass(frozen=True)
+class EmbedderConfig:
+    model_path: str  # ArcFace-family .onnx taking one aligned square crop, relative to the working directory
+
+
+@dataclass(frozen=True)
 class Config:
     source: SourceConfig
     detector: DetectorConfig
+    embedder: EmbedderConfig
 
 
 def load_config(path: str | Path) -> Config:

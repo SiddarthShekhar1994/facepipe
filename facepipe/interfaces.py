@@ -63,6 +63,11 @@ class Embedder(ABC):
     def load(self) -> None:
         """Load weights and open the inference session. Called once, before infer()."""
 
+    @property
+    @abstractmethod
+    def input_size(self) -> int:
+        """Side of the square crop infer() expects; the Aligner is built to produce it. Valid after load()."""
+
     @abstractmethod
     def infer(self, crop: np.ndarray) -> Embedding:
         """Embedding of one aligned crop, L2-normalized."""
