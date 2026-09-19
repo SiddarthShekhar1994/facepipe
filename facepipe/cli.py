@@ -5,6 +5,7 @@ import dataclasses
 import pprint
 import sys
 
+from facepipe.bench import bench
 from facepipe.config import ConfigError, load_config
 from facepipe.dashboard import serve
 from facepipe.enroll import enroll
@@ -29,6 +30,13 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser("serve", parents=[common], help="web dashboard: live feed, enrolled list, enroll from webcam")
     p_serve.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback only; the feed has no auth)")
     p_serve.add_argument("--port", type=int, default=8000)
+    p_bench = sub.add_parser("bench", parents=[common], help="per-stage latency and FPS over a fixed video or image directory")
+    p_bench.add_argument("--video", help="video file to run through the pipeline")
+    p_bench.add_argument("--images", help="directory of images to run through the pipeline")
+    p_bench.add_argument("--frames", type=int, default=300, help="frames to measure (default: %(default)s)")
+    p_bench.add_argument("--warmup", type=int, default=30, help="frames to run and discard first (default: %(default)s)")
+    p_bench.add_argument("--repeat", type=int, default=1, help="repeat the whole run and report ranges (default: %(default)s)")
+    p_bench.add_argument("--input-size", type=int, default=None, help="override detector.input_size for this run")
     args = parser.parse_args(argv)
 
     try:
@@ -46,4 +54,6 @@ def main(argv: list[str] | None = None) -> int:
         return enroll(cfg, args.name, args.folder)
     elif args.command == "serve":
         serve(cfg, args.host, args.port)
+    elif args.command == "bench":
+        return bench(cfg, args.video, args.images, args.frames, args.warmup, args.repeat, args.input_size)
     return 0

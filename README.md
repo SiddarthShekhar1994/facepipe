@@ -97,6 +97,7 @@ facepipe run                      # live webcam window, a name or "unknown" on e
 facepipe run --frames 300         # stop after 300 frames and print the timing summary
 facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png, one face each
 facepipe serve                    # dashboard at http://127.0.0.1:8000; Ctrl-C stops it
+facepipe bench --video clip.mp4   # per-stage latency and FPS over a fixed input (or --images DIR)
 python -m unittest discover tests # the math tests
 ```
 
@@ -108,6 +109,11 @@ ignore it.
 `facepipe --help` lists the subcommands. Every subcommand takes `--config`
 (default `config.toml`). Paths inside the config are relative to the
 directory you run from, so run from the repo root.
+
+`[source]` in the config selects the input for `run` and `serve`: the
+webcam (`kind = "webcam"`), a video file (`kind = "video"`, `path`) or a
+directory of images (`kind = "images"`, `path`), so both work without a
+camera.
 
 ## Configuration
 
@@ -208,7 +214,7 @@ facepipe/           the package; one module per concern
   interfaces.py     the six abstract stages
   config.py         TOML -> frozen dataclasses, strict
   cli.py            argparse entry point; the only module that reads argv
-  sources.py        FrameSource implementations: WebcamSource
+  sources.py        FrameSource implementations: webcam, video file, image directory; make_source()
   scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
   align.py          Aligner implementation: Umeyama similarity fit onto the ArcFace template, warpAffine
   arcface.py        Embedder implementation: MobileFaceNet on ONNX Runtime, L2-normalized output
@@ -219,6 +225,7 @@ facepipe/           the package; one module per concern
   draw.py           boxes and labels onto a frame; used by the window and the dashboard
   enroll.py         the enroll command
   dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
+  bench.py          the bench command: fixed input, warm-up, median/p95 per stage, FPS, ranges over repeats
 tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
@@ -228,37 +235,56 @@ pyproject.toml      package metadata and exact dependency pins
 
 ## Performance
 
-Measured on the development laptop (16 logical cores, CPU execution
-provider, 640x480 webcam, one face in frame), from `facepipe run --frames N`
-after the camera warm-up second. Live numbers; the benchmark script over a
-fixed input will replace them.
+`facepipe bench` runs a fixed input through the whole pipeline: warm-up
+frames are discarded, then N frames are measured, and it reports median
+and p95 per stage, mean per face for the per-face stages, and FPS for the
+pipeline alone (detect + align + embed + match) and end to end. It refuses
+the webcam on purpose: a camera paces the loop and changes the picture
+every run. `--repeat` reports ranges across runs, because this laptop's CPU
+changes state between sessions (the same detector on the same input has
+measured 16 ms and 37 ms hours apart). Every row below is `--repeat 3`,
+300 frames after 30 warm-up.
 
-| Stage | P1 session, detect only, window | P3 session, full pipeline, window | P4 session, full pipeline, dashboard |
+Development laptop: 16 logical cores, ONNX Runtime 1.30 CPU execution
+provider, one thread pool per model, spinning off (see `ort_session.py`).
+
+| Input | detector `input_size` | read | detect (median, p95) | align per face | embed per face | match | pipeline fps | end-to-end fps |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| webcam clip, 640x480, 30 s, one face | 640 | 0.3 ms | 16.0-16.9 ms, p95 20 | 0.3 ms | 5.8-6.1 ms | 0.0 ms | 42.6-43.9 | 41.7-43.0 |
+| webcam clip, 640x480, 30 s, one face | 320 | 0.3 ms | 5.2-6.3 ms, p95 6-8 | 0.3 ms | 5.6-7.0 ms | 0.0 ms | 72-88 | 70-85 |
+| LFW `George_W_Bush/`, 530 press photos 250x250, 1.3 faces/frame | 640 | 0.7-1.5 ms | 14.4-16.5 ms, p95 19 | 0.3 ms | 5.8-6.2 ms | 0.0 ms | 40.0-42.5 | 37.6-41.0 |
+
+Reproduce with `facepipe bench --video data/bench/clip.mp4 --repeat 3`
+(any 640x480 clip with one face; ours is a 30-second webcam recording and is
+not committed), `--input-size 320` for the second row, and
+`facepipe bench --images <lfw>/George_W_Bush --repeat 3` for the third,
+which anyone with LFW can run.
+
+What the numbers say: the detector is the cost, and its cost is set by
+`input_size`, not by the frame - halving the letterbox side quarters the
+work and buys 3x on detection. Embedding is ~6 ms per face and scales with
+faces in frame. Alignment and matching are noise. The camera, when there is
+one, caps everything at 30 fps.
+
+### Live sessions
+
+The same stages measured inside `facepipe run` and `facepipe serve` in
+earlier phases, with the camera pacing the loop; kept because they show the
+display cost and the day-to-day variance.
+
+| Stage | P1, detect only, window | P3, full pipeline, window | P4, full pipeline, dashboard |
 | --- | --- | --- | --- |
 | read (webcam) | 2-4 ms | 8 ms | 5-10 ms |
-| detect (SCRFD-500M, `input_size=640`) | 23-25 ms (6.3 ms at 320) | 37 ms | 37-39 ms |
-| align (per face) | - | 0.7 ms | 0.7 ms |
-| embed (MobileFaceNet, per face) | - | 13 ms | 13.5 ms |
-| match (5-row gallery) | - | 0.1 ms | 0.1 ms |
-| display (draw + imshow + waitKey) | 7-9 ms | 12 ms | - |
-| encode (draw + JPEG) | - | - | 1.7 ms |
-| end to end | ~27 fps (camera caps at 30) | 13.3 fps | 16 fps |
+| detect (`input_size=640`) | 23-25 ms | 37 ms | 37-39 ms |
+| align + embed + match (one face) | - | 14 ms | 14 ms |
+| display (imshow + waitKey) / encode (JPEG) | 7-9 ms | 12 ms | 1.7 ms |
+| end to end | ~27 fps | 13.3 fps | 16 fps |
 
-Two things to read out of this:
-
-- The same detector on the same input measured 23 ms in one session and
-  37 ms in another. That is the laptop (CPU frequency and thermal state),
-  not the code, and it is why the benchmark will report a spread rather
-  than one number.
-- With two ONNX Runtime sessions alternating every frame, each pool's
-  workers spin-wait after their run and compete with the other pool:
-  detect went 37 -> 56 ms and embed 10 -> 20 ms. Disabling spinning
-  (`session.intra_op.allow_spinning = 0`, in `ort_session.py`) restores the
-  solo numbers. Fewer threads made it worse; both models use the cores.
-
-`display` is dominated by `waitKey`, which pumps the window's message
-loop; the dashboard pays 1.7 ms of JPEG encoding instead, which is why it
-is faster than the window.
+Two things happened between sessions: the two ONNX Runtime sessions were
+found to fight over cores when their thread pools spin-wait (detect went
+37 -> 56 ms until spinning was disabled), and the laptop itself ran the
+identical detector at 23, 37 and 16 ms on different days. The benchmark
+table above is the one to quote; the live numbers are what a user sees.
 
 ## Model licenses
 
@@ -287,6 +313,7 @@ reasons are labelled as such.
 | Matching: cosine, best enrolled row per person | mean embedding per person | Cosine is one dot product because embeddings are unit length. Scoring a person by their best row is what makes enrolling several photos useful: a half-turned query matches the half-turned photo, where a mean of frontal and turned fits neither. The cost is that one mislabelled enrolled image gives that person false matches, which is why enroll refuses to guess on multi-face images. |
 | `http.server` (standard library) for the dashboard | Flask; FastAPI + uvicorn | Three endpoints and one page. Flask would be about 40 lines shorter and is the ease choice; it costs seven packages. FastAPI is async and ten-plus packages for a page with no concurrency problem. The dashboard is not what the project is about, and a target box is happier with fewer packages, so zero-dep won. |
 | MJPEG stream for the live feed | polling a JPEG URL from JavaScript; WebSocket | One `<img>` tag and no JavaScript; every browser supports it; the server pushes at the pipeline's rate. Polling jitters and needs JS; WebSocket needs a library or a hand-written handshake. |
+| `facepipe bench` over a file, medians and ranges | timing the live loop | A camera paces the loop at its own frame rate and changes the picture every run; a file does neither. Median and p95 instead of mean because the first frames after a model loads are slow and a mean hides the shape. Ranges over repeats because the laptop's CPU state moves the numbers by 2x between sessions and one number would be a lie. |
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |

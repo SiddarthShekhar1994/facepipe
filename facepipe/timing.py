@@ -29,9 +29,24 @@ class StageTimer:
     def end_frame(self) -> None:
         self._frame_ends.append(perf_counter())
 
+    def reset(self) -> None:
+        """Forget everything so far; the benchmark calls this after its warm-up frames."""
+        self._samples = {s: [] for s in self._stages}
+        self._frame_ends = [perf_counter()]
+        self._window_start = 0
+
+    def samples(self, stage: str) -> np.ndarray:
+        """Every recorded duration of one stage, in milliseconds, one per call."""
+        return np.asarray(self._samples[stage]) * 1000.0
+
     @property
     def frames(self) -> int:
         return len(self._frame_ends) - 1
+
+    @property
+    def elapsed(self) -> float:
+        """Wall-clock seconds from the first frame's start to the last frame's end."""
+        return self._frame_ends[-1] - self._frame_ends[0]
 
     def window(self) -> str:
         start, end = self._window_start, self.frames
