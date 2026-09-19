@@ -10,8 +10,10 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P5 - the full pipeline, the dashboard, a benchmark, and an
-evaluation on LFW plus webcam probes. The threshold is set from that data.
+**Status:** complete. Detection, alignment, embedding, matching, a
+dashboard, a benchmark, an evaluation on LFW plus webcam probes with the
+threshold set from it, and an INT8 quantization dry run with its
+implications for the FPGA target written up below.
 
 ## Architecture
 
@@ -134,7 +136,42 @@ camera.
 key, a missing key, or a value of the wrong type stops the program at
 startup with the key named, rather than silently using a default. Sections
 are added by the phase that reads them, so every key that exists is
-consumed by something.
+consumed by something. `config-int8.toml` is the same file with the INT8
+embedder and its own store, for the quantization measurements; pass it
+with `--config`.
+
+## Enrollment and the store
+
+`facepipe enroll <name> <folder>` runs every image through detect, align
+and embed and writes the result under `data/enrolled/<name>/`:
+
+```
+data/enrolled/alice/
+  meta.json          name, created_at, which embedder file produced the rows, images in row order
+  embeddings.npy     (K, 512) float32; row i came from images[i]
+  001.jpg 002.jpg    the reference images, copied in as given
+```
+
+Why this format:
+
+- `ls data/enrolled` is the list of people. Adding a person, or more images
+  of one, touches only that person's directory, so there is no global index
+  that a crash mid-write can corrupt. Deleting a person is deleting a
+  directory.
+- `.npy` is exact float32 with zero dependencies and one line to load.
+  JSON would be 512 floats of noise per row, pickle is opaque and unsafe to
+  load, and SQLite (standard library, and the obvious next step if this
+  grew) is more machinery than a handful of directories need.
+- `meta.json` records the embedder file because embeddings from different
+  models are silently incomparable. The store refuses to read or append a
+  person enrolled with a different embedder than the one configured.
+- The originals are stored, not the aligned crops, so the gallery can be
+  rebuilt after a model change by re-running enroll.
+
+Images with no face or with more than one face are skipped and named, not
+guessed at: enrolling the wrong person from a group photo is silent and
+poisons every later match. Crop such images to one face. Re-running
+enroll on a name appends to it.
 
 ## Dashboard
 
@@ -268,186 +305,6 @@ capture them with any camera app. Per-image embeddings are cached per
 embedder file, so a re-run costs seconds and the INT8 comparison reuses
 the float side.
 
-## Quantization dry run
-
-The target runs the embedder on a DPU, which is INT8 fixed-point hardware
-with no float datapath, so quantization is not an optimization there; it
-is the only way the model runs at all. `facepipe quantize` produces an
-INT8 copy of the embedder with ONNX Runtime's static quantizer (QDQ
-format, the same graph form AMD's `vai_q_onnx` emits for the Vitis AI
-execution provider), calibrated on 100 aligned LFW crops from people
-outside the evaluation pairs, and reports how well its embeddings agree
-with the float model's on 1,000 more. Two schemes, because the gap
-between them is the finding:
-
-- **`dpu`**: symmetric INT8 weights and activations, one scale per tensor,
-  every scale rounded up to a power of two and the weights re-quantized
-  to match. That is a Vitis AI DPU's arithmetic. Rounding up never
-  saturates but costs up to a bit of resolution; a real DPU quantizer
-  picks the better neighbouring power of two, so this is slightly
-  pessimistic.
-- **`ort`**: per-channel INT8 weights, asymmetric UINT8 activations, the
-  best case for INT8 on an x86 CPU.
-
-Then each INT8 model went through the full evaluation (the float side
-comes from the embedding cache; the enrolled person was re-enrolled from
-the same five images into a separate store, because the store refuses to
-mix embedders) and the benchmark on the same clip.
-
-| | float | INT8 `ort` | INT8 `dpu` |
-| --- | --- | --- | --- |
-| file size | 13.6 MB | 3.7 MB | 3.5 MB |
-| embedding agreement with float, 1,000 crops: mean / p5 / min | - | 0.987 / 0.981 / 0.956 | 0.906 / 0.867 / 0.613 |
-| LFW 10-fold accuracy | 99.52 +/- 0.28% | 99.53 +/- 0.25% | 99.50 +/- 0.31% |
-| LFW same-person median cosine | 0.616 | 0.606 | 0.593 |
-| LFW different-person median / p99 / max | 0.004 / 0.166 / 0.332 | 0.005 / 0.161 / 0.315 | **0.041 / 0.203 / 0.368** |
-| threshold at LFW FAR = 0.1% | 0.256 | 0.257 | **0.297** |
-| at the float threshold 0.26: LFW TAR / FAR | 99.20% / 0.07% | 99.23% / 0.07% | 99.16% / **0.23%** |
-| at 0.26: LFW faces accepted as the enrolled person, of 7,691 | 0 | 0 | **2** |
-| closest stranger to the enrolled gallery | 0.239 | 0.223 | 0.270 |
-| embed, ms per face on the clip, 3 runs | 6.7-7.1 | 18.9-20.4 | 10.1-10.4 |
-| pipeline fps on the clip | 38-40 | 24-28 | 34 |
-
-What it says:
-
-- **Verification accuracy survives both schemes.** 99.5% either way; the
-  loss from per-tensor power-of-two quantization is real (0.906 mean
-  agreement, some crops down to 0.61) but LFW's pairs are far enough
-  apart to absorb it.
-- **The threshold does not survive the `dpu` scheme.** Fixed-point
-  quantization noise is not zero-mean in embedding space: it makes every
-  pair slightly more alike, and the different-person distribution moves
-  up by ~0.04. At the float-derived 0.26, the `dpu` model's false accept
-  rate triples and two strangers get the enrolled person's name; its own
-  FAR = 0.1% point is 0.297. The threshold must be re-derived on the model
-  that is deployed, and enrollment must be done with it too - which is
-  why the store records the embedder file and refuses to mix them.
-- **Where the loss comes from.** Diagnostics on the way to these two
-  schemes: MinMax calibration is markedly worse than percentile (0.92 vs
-  0.96 mean agreement per-tensor) because activation outliers set the
-  range; per-tensor weight scales cost most of the rest, and leaving the
-  first convolution and the final Gemm in float recovers almost nothing,
-  so the loss sits in the depthwise convolutions - the known weak spot of
-  MobileNet-family networks under per-tensor INT8; power-of-two scales
-  cost a further ~0.05.
-- **INT8 is slower on this CPU, and that says nothing about the board.**
-  The quantized graph has 396 nodes against the float model's 98: 200
-  `DequantizeLinear` and 98 `QuantizeLinear`, because ONNX Runtime's CPU
-  provider has no integer PReLU kernel and 33 of the 34 PReLU activations
-  run in float between a dequantize and a quantize. The graph crosses the
-  int8/float boundary about 130 times per face, and the float model runs
-  fused Conv+PReLU kernels. A DPU has no float path to fall back to and
-  PReLU is in its op list as a fixed-point op, so the whole graph stays
-  integer, which is the entire point of the hardware. CPU INT8 pays off
-  only when the runtime keeps the graph in the integer domain end to end.
-
-Reproduce: `facepipe quantize --scheme dpu --calib <lfw> --pairs <pairs.txt>`
-(and `--scheme ort`), then `facepipe enroll --config config-int8.toml ...`,
-`facepipe eval --config config-int8.toml ...` and
-`facepipe bench --config config-int8.toml --video ...`. `config-int8.toml`
-differs from `config.toml` in the embedder path and the store path only.
-
-## Known limitations
-
-Specific to this build, with the evidence where there is any.
-
-- **Pose.** Alignment is a 2D similarity transform; it cannot undo a head
-  turn. A profile crop puts the template's far-eye point on the side of the
-  head (seen in P2), and profile embeddings score far below frontal ones:
-  the dashboard showed "unknown" for the enrolled person in profile with a
-  hand at the face. Enroll frontal images; expect misses beyond ~45
-  degrees.
-- **Lighting and blur.** Live similarity of the enrolled person ranged
-  0.46-0.92 over 150 frames under motion; the probe set, captured still,
-  never dropped below 0.585. Strong backlight and fast motion are the
-  cases that reach the threshold.
-- **Occlusion.** Glasses were on in every enrolled and probe image, so
-  their effect is unmeasured here; masks and hands over the face reduce
-  the detector's confidence first (it uses `conf_threshold = 0.5`) and
-  the embedding second.
-- **Single-image enrollment is weak.** Best-row scoring means one enrolled
-  image covers one pose and one lighting; the five-image enrollment here
-  scored its own probes 0.47-0.71 pairwise but 0.59-0.71 best-per-probe.
-  Enroll several images, in the conditions the camera will see.
-- **Demographic bias in the pretrained weights.** Both models were trained
-  on web-scraped datasets (WIDER FACE for the detector, WebFace600K for the
-  embedder) whose demographic balance is not controlled, and face
-  recognition models are documented to have higher error rates for some
-  groups than others (NIST FRVT reports). LFW itself is skewed towards
-  public figures, mostly white and male, so the 99.5% here is not a
-  guarantee for other faces. This project measures one enrolled person.
-- **Same person, two names** is not prevented; the matcher reports
-  whichever name has the closest image.
-- **No liveness detection.** A photo of an enrolled person held up to the
-  camera is that person. Out of scope by design.
-- **Small-face recall.** SCRFD-500M at `input_size = 640` handles faces
-  down to roughly 20 px; at 320 it loses small and distant faces, which is
-  the price of its 3x speed.
-- **False accepts scale with the gallery**, as described under Threshold.
-
-## Enrollment and the store
-
-`facepipe enroll <name> <folder>` runs every image through detect, align
-and embed and writes the result under `data/enrolled/<name>/`:
-
-```
-data/enrolled/alice/
-  meta.json          name, created_at, which embedder file produced the rows, images in row order
-  embeddings.npy     (K, 512) float32; row i came from images[i]
-  001.jpg 002.jpg    the reference images, copied in as given
-```
-
-Why this format:
-
-- `ls data/enrolled` is the list of people. Adding a person, or more images
-  of one, touches only that person's directory, so there is no global index
-  that a crash mid-write can corrupt. Deleting a person is deleting a
-  directory.
-- `.npy` is exact float32 with zero dependencies and one line to load.
-  JSON would be 512 floats of noise per row, pickle is opaque and unsafe to
-  load, and SQLite (standard library, and the obvious next step if this
-  grew) is more machinery than a handful of directories need.
-- `meta.json` records the embedder file because embeddings from different
-  models are silently incomparable. The store refuses to read or append a
-  person enrolled with a different embedder than the one configured.
-- The originals are stored, not the aligned crops, so the gallery can be
-  rebuilt after a model change by re-running enroll.
-
-Images with no face or with more than one face are skipped and named, not
-guessed at: enrolling the wrong person from a group photo is silent and
-poisons every later match. Crop such images to one face. Re-running
-enroll on a name appends to it.
-
-## Layout
-
-```
-facepipe/           the package; one module per concern
-  types.py          data that crosses stage boundaries: Frame, Detection, Embedding, Match, Identity
-  interfaces.py     the six abstract stages
-  config.py         TOML -> frozen dataclasses, strict
-  cli.py            argparse entry point; the only module that reads argv
-  sources.py        FrameSource implementations: webcam, video file, image directory; make_source()
-  scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
-  align.py          Aligner implementation: Umeyama similarity fit onto the ArcFace template, warpAffine
-  arcface.py        Embedder implementation: MobileFaceNet on ONNX Runtime, L2-normalized output
-  matcher.py        Matcher implementation: cosine, best row per person, threshold, top-k; build_gallery
-  store.py          Store implementation: one directory per person
-  ort_session.py    the one place ONNX Runtime sessions are opened (provider, threading, logging)
-  pipeline.py       Pipeline.process(frame): detect -> align -> embed -> match, one FaceResult per face
-  draw.py           boxes and labels onto a frame; used by the window and the dashboard
-  enroll.py         the enroll command
-  dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
-  bench.py          the bench command: fixed input, warm-up, median/p95 per stage, FPS, ranges over repeats
-  evaluate.py       the eval command: LFW pairs protocol, webcam probes vs the gallery, TAR/FAR, threshold
-  quantize.py       the quantize command: INT8 embedder, dpu (per-tensor, power-of-two) or ort (per-channel) scheme
-config-int8.toml    config.toml with the INT8 embedder and its own store, for the quantization measurements
-tests/              unittest; only the math that everything else depends on
-  timing.py         StageTimer: per-stage ms and FPS for the frame loop
-  run.py            the live loop behind `facepipe run`
-config.toml         the single config file
-pyproject.toml      package metadata and exact dependency pins
-```
-
 ## Performance
 
 `facepipe bench` runs a fixed input through the whole pipeline: warm-up
@@ -501,13 +358,214 @@ found to fight over cores when their thread pools spin-wait (detect went
 identical detector at 23, 37 and 16 ms on different days. The benchmark
 table above is the one to quote; the live numbers are what a user sees.
 
+## Quantization dry run
+
+The target runs the embedder on a DPU, which is INT8 fixed-point hardware
+with no float datapath, so quantization is not an optimization there; it
+is the only way the model runs at all. `facepipe quantize` produces an
+INT8 copy of the embedder with ONNX Runtime's static quantizer (QDQ
+format, the same graph form AMD's `vai_q_onnx` emits for the Vitis AI
+execution provider), calibrated on 100 aligned LFW crops from people
+outside the evaluation pairs, and reports how well its embeddings agree
+with the float model's on 1,000 more. Two schemes, because the gap
+between them is the finding:
+
+- **`dpu`**: symmetric INT8 weights and activations, one scale per tensor,
+  every scale rounded up to a power of two and the weights re-quantized
+  to match. That is a Vitis AI DPU's arithmetic. Rounding up never
+  saturates but costs up to a bit of resolution; a real DPU quantizer
+  picks the better neighbouring power of two, so this is slightly
+  pessimistic.
+- **`ort`**: per-channel INT8 weights, asymmetric UINT8 activations, the
+  best case for INT8 on an x86 CPU.
+
+Then each INT8 model went through the full evaluation (the float side
+comes from the embedding cache; the enrolled person was re-enrolled from
+the same five images into a separate store, because the store refuses to
+mix embedders) and the benchmark on the same clip.
+
+| | float | INT8 `ort` | INT8 `dpu` |
+| --- | --- | --- | --- |
+| file size | 13.6 MB | 3.7 MB | 3.5 MB |
+| embedding agreement with float, 1,000 crops: mean / p5 / min | - | 0.987 / 0.981 / 0.956 | 0.906 / 0.867 / 0.613 |
+| LFW 10-fold accuracy | 99.52 +/- 0.28% | 99.53 +/- 0.25% | 99.50 +/- 0.31% |
+| LFW same-person median cosine | 0.616 | 0.606 | 0.593 |
+| LFW different-person median / p99 / max | 0.004 / 0.166 / 0.332 | 0.005 / 0.161 / 0.315 | **0.041 / 0.203 / 0.368** |
+| threshold at LFW FAR = 0.1% | 0.256 | 0.257 | **0.297** |
+| at the float threshold 0.26: LFW TAR / FAR | 99.20% / 0.07% | 99.23% / 0.07% | 99.16% / **0.23%** |
+| at 0.26: LFW faces accepted as the enrolled person, of 7,691 | 0 | 0 | **2** |
+| closest stranger to the enrolled gallery | 0.239 | 0.223 | 0.270 |
+| embed, ms per face on the clip, 3 runs, all in one session | 6.7-7.1 | 18.9-20.4 | 10.1-10.4 |
+| pipeline fps on the clip | 38-40 | 24-28 | 34 |
+
+What it says:
+
+- **Verification accuracy survives both schemes.** 99.5% either way; the
+  loss from per-tensor power-of-two quantization is real (0.906 mean
+  agreement, some crops down to 0.61) but LFW's pairs are far enough
+  apart to absorb it.
+- **The threshold does not survive the `dpu` scheme.** Fixed-point
+  quantization noise is not zero-mean in embedding space: it makes every
+  pair slightly more alike, and the different-person distribution moves
+  up by ~0.04. At the float-derived 0.26, the `dpu` model's false accept
+  rate triples and two strangers get the enrolled person's name; its own
+  FAR = 0.1% point is 0.297. The threshold must be re-derived on the model
+  that is deployed, and enrollment must be done with it too - which is
+  why the store records the embedder file and refuses to mix them.
+- **Where the loss comes from.** Diagnostics on the way to these two
+  schemes: MinMax calibration is markedly worse than percentile (0.92 vs
+  0.96 mean agreement per-tensor) because activation outliers set the
+  range; per-tensor weight scales cost most of the rest, and leaving the
+  first convolution and the final Gemm in float recovers almost nothing,
+  so the loss sits in the depthwise convolutions - the known weak spot of
+  MobileNet-family networks under per-tensor INT8; power-of-two scales
+  cost a further ~0.05.
+- **INT8 is slower on this CPU, and that says nothing about the board.**
+  The quantized graph has 396 nodes against the float model's 98: 200
+  `DequantizeLinear` and 98 `QuantizeLinear`, because ONNX Runtime's CPU
+  provider has no integer PReLU kernel and 33 of the 34 PReLU activations
+  run in float between a dequantize and a quantize. The graph crosses the
+  int8/float boundary about 130 times per face, and the float model runs
+  fused Conv+PReLU kernels. A DPU has no float path to fall back to and
+  PReLU is in its op list as a fixed-point op, so the whole graph stays
+  integer, which is the entire point of the hardware. CPU INT8 pays off
+  only when the runtime keeps the graph in the integer domain end to end.
+
+Reproduce: `facepipe quantize --scheme dpu --calib <lfw> --pairs <pairs.txt>`
+(and `--scheme ort`), then `facepipe enroll --config config-int8.toml ...`,
+`facepipe eval --config config-int8.toml ...` and
+`facepipe bench --config config-int8.toml --video ...`. `config-int8.toml`
+differs from `config.toml` in the embedder path and the store path only.
+
+## Moving to the FPGA
+
+The target system runs detection and recognition on an AMD FPGA board
+with a DPU (Vitis AI's INT8 convolution engine), a server does the
+embedding comparison, and a web dashboard shows the feed and manages
+profiles. The stage interfaces were drawn so that this move swaps
+implementations without touching neighbours. Stage by stage:
+
+| Stage | This repo | On the target | Where |
+| --- | --- | --- | --- |
+| FrameSource | OpenCV `VideoCapture` | the board's capture path (V4L2 / MIPI into the ARM side); same `read()` contract | host (ARM) |
+| Detector: letterbox | numpy in `scrfd.py` | same arithmetic in C++, or a Vitis Vision resize kernel in the PL | host or PL |
+| Detector: network | ONNX Runtime CPU | **DPU kernel**: SCRFD quantized to INT8 by `vai_q`, compiled to an `.xmodel`, run through the Vitis AI execution provider or VART | DPU |
+| Detector: anchor decode, NMS | numpy in `scrfd.py` | same code, in C++ | host |
+| Aligner | Umeyama fit + `warpAffine` | same; 0.5 ms on a laptop core, a few ms on a Cortex-A72; not a DPU op | host |
+| Embedder: network | ONNX Runtime CPU | **DPU kernel**; its output is INT8, so dequantize and L2-normalize on the host | DPU, then host |
+| Matcher, Store | numpy, a directory | unchanged, on the server; the gallery is built with the deployed quantized model | server |
+| Dashboard | stdlib HTTP on the laptop | the server's web app; the board streams frames with boxes, or the server re-draws from results | server |
+
+**Which stages become hardware kernels.** Exactly two: the detector's and
+the embedder's convolutional networks. Both graphs are Conv, BatchNorm,
+PReLU, Add, Flatten and Gemm (checked with `onnx`), all in the DPU's
+op list, with BatchNorm folded into Conv at compile time. In this code
+that is two classes: `ScrfdDetector.load()`/`infer()` and
+`ArcFaceEmbedder.load()`/`infer()` get DPU-backed implementations - `load()`
+opens the runner, `infer()` keeps the same numpy contract - and the
+`model_path` keys point at `.xmodel` files. Nothing else changes, which
+is what `load()`/`infer()` behind an interface and weight paths in config
+were for.
+
+**Why quantization is mandatory.** The DPU is an array of INT8
+multiply-accumulate units with no float datapath; a float model does not
+run slowly on it, it does not run. The dry run above is the rehearsal
+for that step, and its lessons transfer directly: quantize with the
+vendor tool, calibrate on ~100 aligned crops from the deployment camera,
+then **re-run the evaluation on the quantized model and take the
+threshold from that curve** - the float-derived threshold let strangers
+through the per-tensor model here - and enroll with the deployed model,
+never with the float one. The store's embedder tag enforces the last
+point today by file name; on the target it should be a model hash sent
+with every embedding so the server can refuse a mismatch. Expect the
+per-tensor power-of-two loss measured here (0.906 mean agreement,
+verification accuracy intact). If the board's own evaluation shows more,
+the levers are Vitis AI's fast-finetune, quantization-aware training, or
+a backbone with fewer depthwise convolutions, which quantize badly
+per-tensor. PReLU is listed as a DPU-supported op; confirm it against the
+op table of the specific DPU, because the alternative is retraining with
+ReLU.
+
+**What stays on the host.** Capture, letterboxing, anchor decode and NMS,
+the alignment warp, dequantizing and L2-normalizing the embedder output,
+and networking. The Python here is the reference for each: the decode in
+`scrfd.py` and the Umeyama fit in `align.py` are the specifications a
+C++ port has to match, and the tests in `tests/` are the acceptance
+tests for that port.
+
+**Where the server boundary lands.** After the embedder. Per face per
+frame the board sends a box, a confidence and a 512-float embedding,
+about 2 KB, so five faces at 15 fps is ~150 KB/s. The server owns the
+store, the matcher, the threshold, and the dashboard; the board never
+holds the gallery, so enrolled faces and their embeddings stay in one
+place. Enrollment from the dashboard works exactly as it does here: the
+server keeps the embedding the board already computed for the face on
+screen. The pipeline's cost split makes the same point: on this laptop
+matching is 0.1 ms against a five-row gallery and is one matrix-vector
+product for thousands, so it belongs with the data, not on the board.
+
+**What the laptop numbers do and do not predict.** The accuracy numbers
+transfer, with the caveats above. The latency numbers do not: CPU INT8
+was slower here for reasons a DPU does not have. A DPU's throughput is
+its MAC count times its clock; both networks here are of order half a
+billion operations per face, which is milliseconds on a mid-size DPU at
+realistic utilization, with the letterbox, decode, warp and normalize on
+the ARM cores likely to be the larger share of the frame time. That is
+the same shape as this laptop's profile, where the model runs are
+already the cheapest part of a frame that includes capture and display.
+An aside: this laptop's Ryzen 7 8840HS carries an XDNA NPU that the same
+Vitis AI execution provider targets through the Ryzen AI SDK, so the
+software path (quantized ONNX, VitisAI EP) can be rehearsed without a
+board.
+
+## Known limitations
+
+Specific to this build, with the evidence where there is any.
+
+- **Pose.** Alignment is a 2D similarity transform; it cannot undo a head
+  turn. A profile crop puts the template's far-eye point on the side of the
+  head (seen in P2), and profile embeddings score far below frontal ones:
+  the dashboard showed "unknown" for the enrolled person in profile with a
+  hand at the face. Enroll frontal images; expect misses beyond ~45
+  degrees.
+- **Lighting and blur.** Live similarity of the enrolled person ranged
+  0.46-0.92 over 150 frames under motion; the probe set, captured still,
+  never dropped below 0.585. Strong backlight and fast motion are the
+  cases that reach the threshold.
+- **Occlusion.** Glasses were on in every enrolled and probe image, so
+  their effect is unmeasured here; masks and hands over the face reduce
+  the detector's confidence first (it uses `conf_threshold = 0.5`) and
+  the embedding second.
+- **Single-image enrollment is weak.** Best-row scoring means one enrolled
+  image covers one pose and one lighting; the five-image enrollment here
+  scored its own probes 0.47-0.71 pairwise but 0.59-0.71 best-per-probe.
+  Enroll several images, in the conditions the camera will see.
+- **Demographic bias in the pretrained weights.** Both models were trained
+  on web-scraped datasets (WIDER FACE for the detector, WebFace600K for the
+  embedder) whose demographic balance is not controlled, and face
+  recognition models are documented to have higher error rates for some
+  groups than others (NIST FRVT reports). LFW itself is skewed towards
+  public figures, mostly white and male, so the 99.5% here is not a
+  guarantee for other faces. This project measures one enrolled person.
+- **Same person, two names** is not prevented; the matcher reports
+  whichever name has the closest image.
+- **No liveness detection.** A photo of an enrolled person held up to the
+  camera is that person. Out of scope by design.
+- **Small-face recall.** SCRFD-500M at `input_size = 640` handles faces
+  down to roughly 20 px; at 320 it loses small and distant faces, which is
+  the price of its 3x speed.
+- **False accepts scale with the gallery**, as described under Threshold.
+
 ## Model licenses
 
 | Model | Source | License |
 | --- | --- | --- |
-| MobileFaceNet, `w600k_mbf.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | Same terms as the detector: non-commercial research only. Trained on WebFace600K, itself a research-use dataset. Every high-accuracy face recognition weight set available is in this position because the training sets are; SFace from OpenCV Zoo (Apache-2.0) is the permissive option at lower accuracy. |
-| LFW (evaluation data, not a model) | University of Massachusetts; mirrored on figshare, files 5976018 (`lfw.tgz`, 172 MB) and 5976006 (`pairs.txt`) | Distributed for research; the images are web-scraped and their subjects did not consent to face-recognition use, which is why it is used here for measurement only and never committed. |
 | SCRFD-500M, `det_500m.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | InsightFace's code is MIT, but its README states that the training data and the models trained on it "are available for non-commercial research purposes only", and that this applies to manual downloads from GitHub as well. This project is research/educational use. A commercial deployment would need weights trained on licensed data; YuNet (MIT) is the permissively licensed detector option. |
+| MobileFaceNet, `w600k_mbf.onnx` | InsightFace `buffalo_sc` pack, GitHub release v0.7 | Same terms as the detector: non-commercial research only. Trained on WebFace600K, itself a research-use dataset. Every high-accuracy face recognition weight set available is in this position because the training sets are; SFace from OpenCV Zoo (Apache-2.0) is the permissive option at lower accuracy. The INT8 models `facepipe quantize` writes are derived from these weights and carry the same terms. |
+| LFW (evaluation data, not a model) | University of Massachusetts; mirrored on figshare, files 5976018 (`lfw.tgz`, 172 MB) and 5976006 (`pairs.txt`) | Distributed for research; the images are web-scraped and their subjects did not consent to face-recognition use, which is why it is used here for measurement only and never committed. |
+
+Nothing under `models/` or `data/` is committed; the repository holds code,
+configuration and this document.
 
 ## Tooling decisions
 
@@ -537,3 +595,33 @@ reasons are labelled as such.
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |
+
+## Layout
+
+```
+facepipe/           the package; one module per concern
+  types.py          data that crosses stage boundaries: Frame, Detection, Embedding, Match, Identity
+  interfaces.py     the six abstract stages
+  config.py         TOML -> frozen dataclasses, strict
+  cli.py            argparse entry point; the only module that reads argv
+  sources.py        FrameSource implementations: webcam, video file, image directory; make_source()
+  scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
+  align.py          Aligner implementation: Umeyama similarity fit onto the ArcFace template, warpAffine
+  arcface.py        Embedder implementation: MobileFaceNet on ONNX Runtime, L2-normalized output
+  matcher.py        Matcher implementation: cosine, best row per person, threshold, top-k; build_gallery
+  store.py          Store implementation: one directory per person
+  ort_session.py    the one place ONNX Runtime sessions are opened (provider, threading, logging)
+  pipeline.py       Pipeline.process(frame): detect -> align -> embed -> match, one FaceResult per face
+  draw.py           boxes and labels onto a frame; used by the window and the dashboard
+  enroll.py         the enroll command
+  dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
+  bench.py          the bench command: fixed input, warm-up, median/p95 per stage, FPS, ranges over repeats
+  evaluate.py       the eval command: LFW pairs protocol, webcam probes vs the gallery, TAR/FAR, threshold
+  quantize.py       the quantize command: INT8 embedder, dpu (per-tensor, power-of-two) or ort (per-channel) scheme
+  timing.py         StageTimer: per-stage ms and FPS for the frame loop
+  run.py            the live loop behind `facepipe run`
+tests/              unittest; only the math that everything else depends on
+config.toml         the single config file
+config-int8.toml    config.toml with the INT8 embedder and its own store, for the quantization measurements
+pyproject.toml      package metadata and exact dependency pins
+```
