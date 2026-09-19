@@ -13,6 +13,7 @@ import numpy as np
 import onnxruntime as ort
 
 from facepipe.interfaces import Detector
+from facepipe.ort_session import open_session
 from facepipe.types import Detection, Frame
 
 
@@ -32,12 +33,10 @@ class ScrfdDetector(Detector):
         self._centers: list[np.ndarray] = []
 
     def load(self) -> None:
-        opts = ort.SessionOptions()
-        # The file's output-shape metadata was recorded at 640x640. At any
-        # other input_size ORT logs a shape-mismatch warning for all nine
-        # outputs on every run; the values are correct. Errors still print.
-        opts.log_severity_level = 3
-        self._session = ort.InferenceSession(self._model_path, opts, providers=["CPUExecutionProvider"])
+        # Warnings are silenced because the file's output-shape metadata was
+        # recorded at 640x640: at any other input_size ORT logs a shape
+        # mismatch for all nine outputs on every run. The values are correct.
+        self._session = open_session(self._model_path, silence_warnings=True)
         self._input_name = self._session.get_inputs()[0].name
         self._centers = [self._anchor_centers(stride) for stride in self.STRIDES]
 

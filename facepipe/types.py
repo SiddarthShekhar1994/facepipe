@@ -42,3 +42,11 @@ class Identity:
     name: str
     embeddings: np.ndarray  # (K, D) float32, one row per enrolled image
     image_paths: list[str]  # the reference images those rows came from
+
+
+@dataclass(frozen=True)
+class FaceResult:
+    """One face in a frame with its gallery matches, best first. No matches means unknown."""
+
+    detection: Detection
+    matches: list[Match]

@@ -11,6 +11,7 @@ import numpy as np
 import onnxruntime as ort
 
 from facepipe.interfaces import Embedder
+from facepipe.ort_session import open_session
 from facepipe.types import Embedding
 
 
@@ -22,7 +23,7 @@ class ArcFaceEmbedder(Embedder):
         self._input_size = 0
 
     def load(self) -> None:
-        self._session = ort.InferenceSession(self._model_path, providers=["CPUExecutionProvider"])
+        self._session = open_session(self._model_path)
         inp = self._session.get_inputs()[0]
         n, c, h, w = inp.shape
         if not (isinstance(h, int) and h == w):

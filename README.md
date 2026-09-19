@@ -10,8 +10,9 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P2 - detection, alignment, embedding, and enrollment from a folder
-of images. No live matching yet.
+**Status:** P3 - the full pipeline runs live: every face in the frame is
+detected, aligned, embedded and matched against the enrolled gallery, and
+labelled with a name or "unknown". Threshold is provisional until P5.
 
 ## Architecture
 
@@ -58,9 +59,14 @@ Rules the code follows:
 4. `Embedder.infer(crop)` returns an `Embedding`: a float32 vector,
    L2-normalized by contract, so cosine similarity is a dot product.
 5. `Matcher.match(embedding, gallery_names, gallery)` compares it against
-   every enrolled embedding from the `Store` and returns the identities that
-   clear the threshold, best first. An empty list is the "unknown" path.
-6. The dashboard draws each box with its label, or "unknown".
+   every enrolled embedding from the `Store` (one matvec; a person with
+   several enrolled images is scored by their best one) and returns the
+   identities that clear the threshold, best first. An empty list is the
+   "unknown" path.
+6. The display draws each box with `name similarity`, or "unknown".
+
+Steps 2-5 are `Pipeline.process(frame)` in `pipeline.py`; it returns one
+`FaceResult` per face, and both the live loop and the dashboard call it.
 
 ## Setup
 
@@ -87,7 +93,7 @@ That yields `models/buffalo_sc/det_500m.onnx` (the detector, 2.5 MB) and
 
 ```
 facepipe show-config              # loads and validates config.toml, prints it
-facepipe run                      # live webcam window; q or Esc quits
+facepipe run                      # live webcam window, a name or "unknown" on every face; q or Esc quits
 facepipe run --frames 300         # stop after 300 frames and print the timing summary
 facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png, one face each
 python -m unittest discover tests # the math tests
@@ -109,6 +115,26 @@ key, a missing key, or a value of the wrong type stops the program at
 startup with the key named, rather than silently using a default. Sections
 are added by the phase that reads them, so every key that exists is
 consumed by something.
+
+## Threshold
+
+A face is named when its cosine similarity to an enrolled image reaches
+`matcher.threshold` in `config.toml`. **The current value, 0.4, is
+provisional.** It was set from a handful of observations, not from data:
+
+| Pair | Cosine |
+| --- | --- |
+| Same person, same pose, frames 1.5 s apart | 0.92 |
+| Five enrollment frames of one person, pairwise | 0.76 - 0.96 |
+| Same person over 115 live frames (moving, turning) | 0.46 - 0.92, mean 0.78 |
+| Frontal with a drawn overlay vs looking down | 0.53 |
+| A face vs a random-noise crop | 0.13 |
+
+Same-person similarities drop into the 0.4-0.5 range under motion blur and
+head turns; a few live frames fall below 0.4 and flicker to "unknown".
+Where different-person similarities sit is not known yet. The evaluation
+(P5) measures both distributions on a labelled set and picks the threshold
+from the TAR/FAR curve; this section is rewritten then.
 
 ## Enrollment and the store
 
@@ -155,7 +181,10 @@ facepipe/           the package; one module per concern
   scrfd.py          Detector implementation: SCRFD on ONNX Runtime (letterbox, anchor decode, NMS)
   align.py          Aligner implementation: Umeyama similarity fit onto the ArcFace template, warpAffine
   arcface.py        Embedder implementation: MobileFaceNet on ONNX Runtime, L2-normalized output
+  matcher.py        Matcher implementation: cosine, best row per person, threshold, top-k; build_gallery
   store.py          Store implementation: one directory per person
+  ort_session.py    the one place ONNX Runtime sessions are opened (provider, threading, logging)
+  pipeline.py       Pipeline.process(frame): detect -> align -> embed -> match, one FaceResult per face
   enroll.py         the enroll command
 tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
@@ -166,24 +195,35 @@ pyproject.toml      package metadata and exact dependency pins
 
 ## Performance
 
-Measured on the development laptop (CPU only, 640x480 webcam), from
-`facepipe run --frames 90`, after the camera warm-up second. The detector
-runs on the CPU execution provider.
+Measured on the development laptop (16 logical cores, CPU execution
+provider, 640x480 webcam, one face in frame), from `facepipe run --frames N`
+after the camera warm-up second. Live numbers; the benchmark script over a
+fixed input will replace them.
 
-| Stage | `input_size=640` | `input_size=320` |
+| Stage | P1 session, detect only | P3 session, full pipeline |
 | --- | --- | --- |
-| detect (SCRFD-500M) | 23-25 ms | 6.3 ms |
-| align (per face) | 0.55 ms | - |
-| embed (MobileFaceNet, per face) | 12.5 ms | - |
-| display (draw + imshow + waitKey) | 7-9 ms | - |
-| read (webcam) | 2-4 ms, camera-paced | - |
-| end to end | ~27 fps (camera caps at 30) | - |
+| read (webcam) | 2-4 ms | 8 ms |
+| detect (SCRFD-500M, `input_size=640`) | 23-25 ms (6.3 ms at 320) | 37 ms |
+| align (per face) | - | 0.7 ms |
+| embed (MobileFaceNet, per face) | - | 13 ms |
+| match (5-row gallery) | - | 0.1 ms |
+| display (draw + imshow + waitKey) | 7-9 ms | 12 ms |
+| end to end | ~27 fps (camera caps at 30) | 13.3 fps |
 
-`read` is cheap because the camera produces frames at 30 fps in the
-background; by the time a 25 ms detection finishes, the next frame is
-already waiting. `display` is dominated by `waitKey`, which pumps the
-window's message loop. A benchmark over a fixed input replaces these live
-numbers once alignment, embedding and matching exist.
+Two things to read out of this:
+
+- The same detector on the same input measured 23 ms in one session and
+  37 ms in another. That is the laptop (CPU frequency and thermal state),
+  not the code, and it is why the benchmark will report a spread rather
+  than one number.
+- With two ONNX Runtime sessions alternating every frame, each pool's
+  workers spin-wait after their run and compete with the other pool:
+  detect went 37 -> 56 ms and embed 10 -> 20 ms. Disabling spinning
+  (`session.intra_op.allow_spinning = 0`, in `ort_session.py`) restores the
+  solo numbers. Fewer threads made it worse; both models use the cores.
+
+`display` is dominated by `waitKey`, which pumps the window's message
+loop; the dashboard will not pay it.
 
 ## Model licenses
 
@@ -209,6 +249,7 @@ reasons are labelled as such.
 | Umeyama similarity fit, in numpy | `cv2.estimateAffinePartial2D`; scikit-image `SimilarityTransform` | The alignment must be a similarity (rotation, uniform scale, translation) fitted over all five landmarks, exactly as at training time. OpenCV's estimator is RANSAC/LMedS-based and with five points may discard one as an outlier. scikit-image is what InsightFace calls, and it computes this same closed form; not worth a dependency for 15 lines. A full affine fit was rejected because it would shear the face. |
 | MobileFaceNet (`w600k_mbf`, 512-d) | ResNet-50 (`w600k_r50`, 166 MB); SFace (OpenCV Zoo) | Already in the downloaded pack, ~10x cheaper than the ResNet-50, and the class of network that would actually be deployed to a DPU, which makes the quantization experiment representative. The accuracy cost is measured in the evaluation; switching is a `model_path` change plus a download. SFace is Apache-2.0 but weaker. |
 | Store: a directory per person, `.npy` + `meta.json` | one JSON index; SQLite; pickle | See "Enrollment and the store". |
+| Matching: cosine, best enrolled row per person | mean embedding per person | Cosine is one dot product because embeddings are unit length. Scoring a person by their best row is what makes enrolling several photos useful: a half-turned query matches the half-turned photo, where a mean of frontal and turned fits neither. The cost is that one mislabelled enrolled image gives that person false matches, which is why enroll refuses to guess on multi-face images. |
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |

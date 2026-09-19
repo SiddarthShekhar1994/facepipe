@@ -45,10 +45,17 @@ class StoreConfig:
 
 
 @dataclass(frozen=True)
+class MatcherConfig:
+    threshold: float  # cosine similarity a face must reach to be named; below it is "unknown"
+    top_k: int  # at most this many names per face, best first
+
+
+@dataclass(frozen=True)
 class Config:
     source: SourceConfig
     detector: DetectorConfig
     embedder: EmbedderConfig
+    matcher: MatcherConfig
     store: StoreConfig
 
 
