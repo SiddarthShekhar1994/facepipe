@@ -1,0 +1,21 @@
+# virtual environment
+.venv/
+
+# python bytecode and packaging
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# model weights: downloaded, not committed (see README)
+models/
+
+# enrolled identities and their face images: personal data, never committed
+data/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

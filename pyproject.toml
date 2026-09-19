@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facepipe"
+version = "0.1.0"
+description = "Local face detection and recognition pipeline: webcam in, labeled faces out."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy==2.5.3",
+]
+
+[tool.setuptools]
+packages = ["facepipe"]
