@@ -29,16 +29,20 @@ class Pipeline:
         self.aligner: ArcFaceAligner | None = None  # sized from the embedder once it is loaded
         self.matcher = CosineMatcher(cfg.matcher.threshold, cfg.matcher.top_k)
         self.store = DirectoryStore(cfg.store.path, Path(cfg.embedder.model_path).name)
-        self._names: list[str] = []
-        self._gallery = np.empty((0, 0), dtype=np.float32)
+        self._gallery: tuple[list[str], np.ndarray] = ([], np.empty((0, 0), dtype=np.float32))
 
     def load(self) -> list[Identity]:
         """Load both models and the gallery. Returns the enrolled identities for reporting."""
         self.detector.load()
         self.embedder.load()
         self.aligner = ArcFaceAligner(self.embedder.input_size)
+        return self.reload_gallery()
+
+    def reload_gallery(self) -> list[Identity]:
+        """Re-read the store. The gallery is one tuple swapped in by one assignment, so a
+        frame being processed on another thread never sees new names with old rows."""
         identities = self.store.identities()
-        self._names, self._gallery = build_gallery(identities)
+        self._gallery = build_gallery(identities)
         return identities
 
     def process(self, frame: Frame) -> list[FaceResult]:
@@ -49,6 +53,7 @@ class Pipeline:
             crops = [self.aligner.align(frame, d.landmarks) for d in detections]
         with self._timer.stage("embed"):
             embeddings = [self.embedder.infer(c) for c in crops]
+        names, gallery = self._gallery
         with self._timer.stage("match"):
-            matches = [self.matcher.match(e, self._names, self._gallery) for e in embeddings]
-        return [FaceResult(d, m) for d, m in zip(detections, matches)]
+            matches = [self.matcher.match(e, names, gallery) for e in embeddings]
+        return [FaceResult(d, e, m) for d, e, m in zip(detections, embeddings, matches)]

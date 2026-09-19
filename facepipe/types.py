@@ -46,7 +46,12 @@ class Identity:
 
 @dataclass(frozen=True)
 class FaceResult:
-    """One face in a frame with its gallery matches, best first. No matches means unknown."""
+    """One face in a frame: where it is, its embedding, and its gallery matches, best first.
+
+    No matches means unknown. The embedding is kept so that enrolling the face
+    on screen does not have to run the models a second time.
+    """
 
     detection: Detection
+    embedding: Embedding
     matches: list[Match]

@@ -6,11 +6,15 @@ import pprint
 import sys
 
 from facepipe.config import ConfigError, load_config
+from facepipe.dashboard import serve
 from facepipe.enroll import enroll
 from facepipe.run import run
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Timing lines are printed once a second from long-running loops; keep
+    # them flowing when stdout is a pipe or a log file, not just a terminal.
+    sys.stdout.reconfigure(line_buffering=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", default="config.toml", help="TOML config file (default: %(default)s)")
 
@@ -22,6 +26,9 @@ def main(argv: list[str] | None = None) -> int:
     p_enroll = sub.add_parser("enroll", parents=[common], help="enroll one person from a folder of images")
     p_enroll.add_argument("name", help="letters, digits, '_' or '-'; also the label drawn on the video")
     p_enroll.add_argument("folder", help="directory of .jpg/.png images, one face each")
+    p_serve = sub.add_parser("serve", parents=[common], help="web dashboard: live feed, enrolled list, enroll from webcam")
+    p_serve.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback only; the feed has no auth)")
+    p_serve.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
 
     try:
@@ -37,4 +44,6 @@ def main(argv: list[str] | None = None) -> int:
         run(cfg, max_frames=args.frames)
     elif args.command == "enroll":
         return enroll(cfg, args.name, args.folder)
+    elif args.command == "serve":
+        serve(cfg, args.host, args.port)
     return 0

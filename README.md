@@ -10,9 +10,9 @@ comparison and a web dashboard showing the live feed and managing enrolled
 profiles. Every stage sits behind an interface so the inference backend can
 be swapped for the FPGA one without touching its neighbours.
 
-**Status:** P3 - the full pipeline runs live: every face in the frame is
-detected, aligned, embedded and matched against the enrolled gallery, and
-labelled with a name or "unknown". Threshold is provisional until P5.
+**Status:** P4 - the full pipeline runs live behind a web dashboard: the
+labelled feed, the list of enrolled people, and enroll-from-webcam.
+Threshold is provisional until P5.
 
 ## Architecture
 
@@ -33,7 +33,7 @@ labelled with a name or "unknown". Threshold is provisional until P5.
   Matcher       cosine vs gallery, threshold, top-k  <----  Store   ---.
        |  list[Match] per face; empty list = unknown          one dir  |  server
        v                                                    per person |
-  Dashboard     live feed with labels, enrolled list, enroll        ---'
+  Dashboard     stdlib HTTP: MJPEG feed, enrolled list, enroll form ---'
 ```
 
 Rules the code follows:
@@ -96,6 +96,7 @@ facepipe show-config              # loads and validates config.toml, prints it
 facepipe run                      # live webcam window, a name or "unknown" on every face; q or Esc quits
 facepipe run --frames 300         # stop after 300 frames and print the timing summary
 facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png, one face each
+facepipe serve                    # dashboard at http://127.0.0.1:8000; Ctrl-C stops it
 python -m unittest discover tests # the math tests
 ```
 
@@ -115,6 +116,36 @@ key, a missing key, or a value of the wrong type stops the program at
 startup with the key named, rather than silently using a default. Sections
 are added by the phase that reads them, so every key that exists is
 consumed by something.
+
+## Dashboard
+
+`facepipe serve` binds `127.0.0.1:8000` (`--host`, `--port`; loopback by
+default because the feed has no authentication) and serves one page: the
+live feed with a name or "unknown" on every face, a form that enrolls the
+face currently on screen under a typed name, and a table of enrolled
+people with their image counts. Plain HTML, no JavaScript, no CSS
+framework.
+
+How it is put together, which is the only interesting part:
+
+- One worker thread owns the camera and both models. It runs read ->
+  `Pipeline.process` -> draw -> JPEG-encode and publishes the latest
+  (raw frame, results, jpeg) as a snapshot under a condition variable.
+  Request threads only read snapshots; no model ever runs on one.
+- The feed is an MJPEG stream (`multipart/x-mixed-replace`): a single
+  `<img src="/stream">`, and the handler writes one JPEG part per new
+  snapshot, so the browser sees exactly the pipeline's frame rate.
+- Enroll-from-webcam reuses the embedding the pipeline already computed
+  for the face on screen (`FaceResult.embedding`), saves the raw frame
+  through the same `Store.add` the CLI uses, and hot-swaps the gallery:
+  `Pipeline.reload_gallery` replaces one tuple in one assignment, so a
+  frame in flight never sees new names with old rows. Zero or several
+  faces in view is refused, as in the CLI.
+- The HTTP layer is the standard library's `ThreadingHTTPServer`; see the
+  tooling table for why not Flask.
+
+Not guarded against: enrolling the same person under two names. The
+matcher will then report whichever name has the most similar image.
 
 ## Threshold
 
@@ -185,7 +216,9 @@ facepipe/           the package; one module per concern
   store.py          Store implementation: one directory per person
   ort_session.py    the one place ONNX Runtime sessions are opened (provider, threading, logging)
   pipeline.py       Pipeline.process(frame): detect -> align -> embed -> match, one FaceResult per face
+  draw.py           boxes and labels onto a frame; used by the window and the dashboard
   enroll.py         the enroll command
+  dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
 tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
@@ -200,15 +233,16 @@ provider, 640x480 webcam, one face in frame), from `facepipe run --frames N`
 after the camera warm-up second. Live numbers; the benchmark script over a
 fixed input will replace them.
 
-| Stage | P1 session, detect only | P3 session, full pipeline |
-| --- | --- | --- |
-| read (webcam) | 2-4 ms | 8 ms |
-| detect (SCRFD-500M, `input_size=640`) | 23-25 ms (6.3 ms at 320) | 37 ms |
-| align (per face) | - | 0.7 ms |
-| embed (MobileFaceNet, per face) | - | 13 ms |
-| match (5-row gallery) | - | 0.1 ms |
-| display (draw + imshow + waitKey) | 7-9 ms | 12 ms |
-| end to end | ~27 fps (camera caps at 30) | 13.3 fps |
+| Stage | P1 session, detect only, window | P3 session, full pipeline, window | P4 session, full pipeline, dashboard |
+| --- | --- | --- | --- |
+| read (webcam) | 2-4 ms | 8 ms | 5-10 ms |
+| detect (SCRFD-500M, `input_size=640`) | 23-25 ms (6.3 ms at 320) | 37 ms | 37-39 ms |
+| align (per face) | - | 0.7 ms | 0.7 ms |
+| embed (MobileFaceNet, per face) | - | 13 ms | 13.5 ms |
+| match (5-row gallery) | - | 0.1 ms | 0.1 ms |
+| display (draw + imshow + waitKey) | 7-9 ms | 12 ms | - |
+| encode (draw + JPEG) | - | - | 1.7 ms |
+| end to end | ~27 fps (camera caps at 30) | 13.3 fps | 16 fps |
 
 Two things to read out of this:
 
@@ -223,7 +257,8 @@ Two things to read out of this:
   solo numbers. Fewer threads made it worse; both models use the cores.
 
 `display` is dominated by `waitKey`, which pumps the window's message
-loop; the dashboard will not pay it.
+loop; the dashboard pays 1.7 ms of JPEG encoding instead, which is why it
+is faster than the window.
 
 ## Model licenses
 
@@ -250,6 +285,8 @@ reasons are labelled as such.
 | MobileFaceNet (`w600k_mbf`, 512-d) | ResNet-50 (`w600k_r50`, 166 MB); SFace (OpenCV Zoo) | Already in the downloaded pack, ~10x cheaper than the ResNet-50, and the class of network that would actually be deployed to a DPU, which makes the quantization experiment representative. The accuracy cost is measured in the evaluation; switching is a `model_path` change plus a download. SFace is Apache-2.0 but weaker. |
 | Store: a directory per person, `.npy` + `meta.json` | one JSON index; SQLite; pickle | See "Enrollment and the store". |
 | Matching: cosine, best enrolled row per person | mean embedding per person | Cosine is one dot product because embeddings are unit length. Scoring a person by their best row is what makes enrolling several photos useful: a half-turned query matches the half-turned photo, where a mean of frontal and turned fits neither. The cost is that one mislabelled enrolled image gives that person false matches, which is why enroll refuses to guess on multi-face images. |
+| `http.server` (standard library) for the dashboard | Flask; FastAPI + uvicorn | Three endpoints and one page. Flask would be about 40 lines shorter and is the ease choice; it costs seven packages. FastAPI is async and ten-plus packages for a page with no concurrency problem. The dashboard is not what the project is about, and a target box is happier with fewer packages, so zero-dep won. |
+| MJPEG stream for the live feed | polling a JPEG URL from JavaScript; WebSocket | One `<img>` tag and no JavaScript; every browser supports it; the server pushes at the pipeline's rate. Polling jitters and needs JS; WebSocket needs a library or a hand-written handshake. |
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |
 | `argparse` | click, typer | Standard library. A handful of subcommands with a few flags does not justify a dependency. Click is nicer to write; that is an ease argument and it lost. |

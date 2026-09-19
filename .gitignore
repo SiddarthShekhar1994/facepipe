@@ -14,8 +14,9 @@ models/
 # enrolled identities and their face images: personal data, never committed
 data/
 
-# editor / OS
+# editor / OS / tooling
 .vscode/
 .idea/
+.claude/
 .DS_Store
 Thumbs.db

@@ -5,14 +5,12 @@ from time import perf_counter
 import cv2
 
 from facepipe.config import Config
+from facepipe.draw import draw_results
 from facepipe.pipeline import STAGES, Pipeline
 from facepipe.sources import WebcamSource
 from facepipe.timing import StageTimer
-from facepipe.types import FaceResult, Frame
 
 WINDOW = "facepipe"
-KNOWN = (0, 200, 0)
-UNKNOWN = (0, 0, 220)
 
 
 def run(cfg: Config, max_frames: int | None = None) -> None:
@@ -48,14 +46,3 @@ def run(cfg: Config, max_frames: int | None = None) -> None:
     cv2.destroyAllWindows()
     print("summary:", timer.summary())
 
-
-def draw_results(frame: Frame, results: list[FaceResult]) -> None:
-    """A box per face with the best match and its similarity, or "unknown", drawn in place."""
-    for r in results:
-        x1, y1, x2, y2 = r.detection.bbox.round().astype(int).tolist()
-        if r.matches:
-            color, label = KNOWN, f"{r.matches[0].name} {r.matches[0].similarity:.2f}"
-        else:
-            color, label = UNKNOWN, "unknown"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
