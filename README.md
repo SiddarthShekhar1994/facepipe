@@ -110,6 +110,7 @@ facepipe enroll alice ./photos    # enroll one person from a folder of .jpg/.png
 facepipe serve                    # dashboard at http://127.0.0.1:8000; Ctrl-C stops it
 facepipe bench --video clip.mp4   # per-stage latency and FPS over a fixed input (or --images DIR)
 facepipe eval --lfw DIR --pairs F  # similarity distributions, TAR/FAR, threshold; see Threshold below
+facepipe quantize --calib DIR     # INT8 copy of the embedder; needs pip install -e ".[quant]"
 python -m unittest discover tests # the math tests
 ```
 
@@ -267,6 +268,85 @@ capture them with any camera app. Per-image embeddings are cached per
 embedder file, so a re-run costs seconds and the INT8 comparison reuses
 the float side.
 
+## Quantization dry run
+
+The target runs the embedder on a DPU, which is INT8 fixed-point hardware
+with no float datapath, so quantization is not an optimization there; it
+is the only way the model runs at all. `facepipe quantize` produces an
+INT8 copy of the embedder with ONNX Runtime's static quantizer (QDQ
+format, the same graph form AMD's `vai_q_onnx` emits for the Vitis AI
+execution provider), calibrated on 100 aligned LFW crops from people
+outside the evaluation pairs, and reports how well its embeddings agree
+with the float model's on 1,000 more. Two schemes, because the gap
+between them is the finding:
+
+- **`dpu`**: symmetric INT8 weights and activations, one scale per tensor,
+  every scale rounded up to a power of two and the weights re-quantized
+  to match. That is a Vitis AI DPU's arithmetic. Rounding up never
+  saturates but costs up to a bit of resolution; a real DPU quantizer
+  picks the better neighbouring power of two, so this is slightly
+  pessimistic.
+- **`ort`**: per-channel INT8 weights, asymmetric UINT8 activations, the
+  best case for INT8 on an x86 CPU.
+
+Then each INT8 model went through the full evaluation (the float side
+comes from the embedding cache; the enrolled person was re-enrolled from
+the same five images into a separate store, because the store refuses to
+mix embedders) and the benchmark on the same clip.
+
+| | float | INT8 `ort` | INT8 `dpu` |
+| --- | --- | --- | --- |
+| file size | 13.6 MB | 3.7 MB | 3.5 MB |
+| embedding agreement with float, 1,000 crops: mean / p5 / min | - | 0.987 / 0.981 / 0.956 | 0.906 / 0.867 / 0.613 |
+| LFW 10-fold accuracy | 99.52 +/- 0.28% | 99.53 +/- 0.25% | 99.50 +/- 0.31% |
+| LFW same-person median cosine | 0.616 | 0.606 | 0.593 |
+| LFW different-person median / p99 / max | 0.004 / 0.166 / 0.332 | 0.005 / 0.161 / 0.315 | **0.041 / 0.203 / 0.368** |
+| threshold at LFW FAR = 0.1% | 0.256 | 0.257 | **0.297** |
+| at the float threshold 0.26: LFW TAR / FAR | 99.20% / 0.07% | 99.23% / 0.07% | 99.16% / **0.23%** |
+| at 0.26: LFW faces accepted as the enrolled person, of 7,691 | 0 | 0 | **2** |
+| closest stranger to the enrolled gallery | 0.239 | 0.223 | 0.270 |
+| embed, ms per face on the clip, 3 runs | 6.7-7.1 | 18.9-20.4 | 10.1-10.4 |
+| pipeline fps on the clip | 38-40 | 24-28 | 34 |
+
+What it says:
+
+- **Verification accuracy survives both schemes.** 99.5% either way; the
+  loss from per-tensor power-of-two quantization is real (0.906 mean
+  agreement, some crops down to 0.61) but LFW's pairs are far enough
+  apart to absorb it.
+- **The threshold does not survive the `dpu` scheme.** Fixed-point
+  quantization noise is not zero-mean in embedding space: it makes every
+  pair slightly more alike, and the different-person distribution moves
+  up by ~0.04. At the float-derived 0.26, the `dpu` model's false accept
+  rate triples and two strangers get the enrolled person's name; its own
+  FAR = 0.1% point is 0.297. The threshold must be re-derived on the model
+  that is deployed, and enrollment must be done with it too - which is
+  why the store records the embedder file and refuses to mix them.
+- **Where the loss comes from.** Diagnostics on the way to these two
+  schemes: MinMax calibration is markedly worse than percentile (0.92 vs
+  0.96 mean agreement per-tensor) because activation outliers set the
+  range; per-tensor weight scales cost most of the rest, and leaving the
+  first convolution and the final Gemm in float recovers almost nothing,
+  so the loss sits in the depthwise convolutions - the known weak spot of
+  MobileNet-family networks under per-tensor INT8; power-of-two scales
+  cost a further ~0.05.
+- **INT8 is slower on this CPU, and that says nothing about the board.**
+  The quantized graph has 396 nodes against the float model's 98: 200
+  `DequantizeLinear` and 98 `QuantizeLinear`, because ONNX Runtime's CPU
+  provider has no integer PReLU kernel and 33 of the 34 PReLU activations
+  run in float between a dequantize and a quantize. The graph crosses the
+  int8/float boundary about 130 times per face, and the float model runs
+  fused Conv+PReLU kernels. A DPU has no float path to fall back to and
+  PReLU is in its op list as a fixed-point op, so the whole graph stays
+  integer, which is the entire point of the hardware. CPU INT8 pays off
+  only when the runtime keeps the graph in the integer domain end to end.
+
+Reproduce: `facepipe quantize --scheme dpu --calib <lfw> --pairs <pairs.txt>`
+(and `--scheme ort`), then `facepipe enroll --config config-int8.toml ...`,
+`facepipe eval --config config-int8.toml ...` and
+`facepipe bench --config config-int8.toml --video ...`. `config-int8.toml`
+differs from `config.toml` in the embedder path and the store path only.
+
 ## Known limitations
 
 Specific to this build, with the evidence where there is any.
@@ -359,6 +439,8 @@ facepipe/           the package; one module per concern
   dashboard.py      the serve command: worker thread, MJPEG stream, enroll form; the only HTTP import
   bench.py          the bench command: fixed input, warm-up, median/p95 per stage, FPS, ranges over repeats
   evaluate.py       the eval command: LFW pairs protocol, webcam probes vs the gallery, TAR/FAR, threshold
+  quantize.py       the quantize command: INT8 embedder, dpu (per-tensor, power-of-two) or ort (per-channel) scheme
+config-int8.toml    config.toml with the INT8 embedder and its own store, for the quantization measurements
 tests/              unittest; only the math that everything else depends on
   timing.py         StageTimer: per-stage ms and FPS for the frame loop
   run.py            the live loop behind `facepipe run`
@@ -449,6 +531,8 @@ reasons are labelled as such.
 | MJPEG stream for the live feed | polling a JPEG URL from JavaScript; WebSocket | One `<img>` tag and no JavaScript; every browser supports it; the server pushes at the pipeline's rate. Polling jitters and needs JS; WebSocket needs a library or a hand-written handshake. |
 | LFW pairs protocol for the evaluation | photographing people I know; a synthetic set | Public, research-licensed, 6,000 labelled pairs with a published reference point for this class of model, so a subtly wrong alignment or normalization would show up as lost accuracy. A hand-made set could not have said that. It is combined with webcam probes of the enrolled person because LFW says nothing about this camera. |
 | Threshold at LFW FAR = 0.1% | EER; max accuracy; the midpoint between the webcam distributions | A system with an "unknown" path is judged on strangers it lets in, so a false-accept target is the right criterion. EER and max-accuracy thresholds (0.19-0.21) let 13 and 3 of 7,691 strangers through this one-person gallery; a webcam-only midpoint (~0.41) would be tuned to one sitting's conditions. |
+| ONNX Runtime static quantization, QDQ format | dynamic quantization; the Vitis AI quantizer | Dynamic quantization keeps activations in float, which a DPU cannot do, so it would measure nothing relevant. The Vitis AI quantizer is the real tool for the board but needs the Vitis AI / Ryzen AI SDK, not a pip install; ORT's emits the same QDQ graph form, and the `dpu` scheme imitates the DPU's per-tensor power-of-two arithmetic on top. `onnx` is an optional extra because it is needed only to produce the model. |
+| Percentile calibration, 100 crops | MinMax, 500 crops; entropy | MinMax sets each range from the single largest activation seen and measured 0.04 worse in agreement. The histogram calibrators keep every activation of every image in memory and ran out of it at 500 crops. |
 | `facepipe bench` over a file, medians and ranges | timing the live loop | A camera paces the loop at its own frame rate and changes the picture every run; a file does neither. Median and p95 instead of mean because the first frames after a model loads are slow and a mean hides the shape. Ranges over repeats because the laptop's CPU state moves the numbers by 2x between sessions and one number would be a lie. |
 | `unittest` | pytest | Standard library. pytest is nicer to write and read; that is an ease argument, and it lost against adding a dependency for a handful of tests. |
 | OpenCV (`opencv-python`) | PyAV / imageio for capture + Pillow for drawing + Tk for a window | One library covers webcam capture, the display window, drawing, and later the alignment warp and image loading. The `-headless` wheel was rejected because it has no `imshow`. On Windows the default MSMF backend opened faster than DirectShow (0.4 s vs 0.7 s) and negotiated 640x480 on the first try, so no backend override. |

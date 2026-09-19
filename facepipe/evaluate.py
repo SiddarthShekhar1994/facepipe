@@ -124,7 +124,7 @@ def evaluate(cfg: Config, lfw: str, pairs: str, probes: str, folds: int | None, 
         for t, label in sorted(rows):
             print(f"| {t:.3f} | {label} | {tar(best, t):.4f} | {far(stranger_best, t):.5f} |")
 
-        with (out_dir / f"tar_far_{name}.csv").open("w", newline="") as f:
+        with (out_dir / f"tar_far_{name}_{Path(cfg.embedder.model_path).stem}.csv").open("w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["threshold", "lfw_tar", "lfw_far", f"{name}_probe_tar", f"lfw_faces_accepted_as_{name}"])
             for t in np.round(np.arange(0.0, 1.0001, 0.01), 2):

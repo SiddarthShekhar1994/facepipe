@@ -1,0 +1,23 @@
+# facepipe configuration. Sections are added by the phase that reads them.
+
+[source]
+kind = "webcam"   # "webcam" | "video" | "images"
+device = 0        # webcam: index as OpenCV enumerates it
+width = 640       # webcam: requested capture size; the driver picks the nearest mode it supports
+height = 480
+# path = "clip.mp4"   # video: the file; images: a directory of .jpg/.png
+
+[detector]
+model_path = "models/buffalo_sc/det_500m.onnx"   # SCRFD-500M with keypoints; see README for the download
+conf_threshold = 0.5                             # faces scoring below this are dropped
+input_size = 640                                 # letterbox side; 320 is ~4x cheaper but loses small faces
+
+[embedder]
+model_path = "models/buffalo_sc/w600k_mbf_int8_dpu.onnx"   # INT8, DPU-like scheme; see README "Quantization dry run"
+
+[matcher]
+threshold = 0.26  # cosine similarity needed to be named; LFW FAR = 0.1% point, see README "Threshold"
+top_k = 3         # names returned per face, best first
+
+[store]
+path = "data/enrolled-int8"   # a separate store: embeddings from different models must not mix
